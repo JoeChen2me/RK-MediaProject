@@ -3,43 +3,62 @@
 
 #include <linux/videodev2.h>
 
+#include <cstddef>
 #include <string>
+
+namespace camera_params
+{
+inline constexpr __u32  kCaptureWidth       = 640;
+inline constexpr __u32  kCaptureHeight      = 480;
+inline constexpr __u32  kCaptureFps         = 30;
+inline constexpr __u32  kRequestBufferCount = 4;
+inline constexpr size_t kMaxMappedBuffers   = 10;
+}  // namespace camera_params
 
 class V4L2_Camera
 {
- public:
-  V4L2_Camera();
-  ~V4L2_Camera();
-  // int Camera_Init(const char* device);
-  int open_camera(const char* device);  // 打开摄像头
-  int open_camera(
-      const std::string& device);  // 重载函数，接受 std::string 参数
-  int check_cameraCapabilities();  // 检查摄像头能力
-  /**
-   * @brief 设置曝光模式/曝光时间。
-   * @param exposure_time_ms 曝光时间（毫秒）；传入 0 表示切换为自动曝光。
-   * @return 0 成功，-1 失败。
-   */
-  int set_exposure_time(int exposure_time_ms);
-  int close_camera();
+   public:
+    V4L2_Camera();
+    ~V4L2_Camera();
+    // int Camera_Init(const char* device);
+    int open_camera(const char* device);         // 打开摄像头
+    int open_camera(const std::string& device);  // 重载函数，接受 std::string 参数
+    int check_cameraCapabilities();  // 检查摄像头的功能支持并设置输出格式、分辨率、帧率等参数
+    int init_camera_buffer();        // 初始化摄像头缓冲区
+    int deinit_camera_buffer();      // 反初始化摄像头缓冲区 用于解除映射
+    int capture_stream_switch(bool enabled);                      // 流式捕获开关
+    int camera_read_frame(void* out_buffer, size_t* out_length);  // 读取一帧数据
 
- private:
-  int camera_fd = -1;
-  struct v4l2_capability cap;
-  struct v4l2_fmtdesc fmtdesc;
-  struct v4l2_frmsizeenum frmsize;
-  struct v4l2_frmivalenum frmival;
-  struct v4l2_format v4l2fmt;
-  struct v4l2_streamparm streamparm;
-  bool isMJPEGSupport = false;
-  bool is640x480Support = false;
-  bool is30fpsSupport = false;
+    int set_exposure_time(int exposure_time_ms);
+    int close_camera();
+
+   private:
+    struct MappedBuffer
+    {
+        void*  base   = nullptr;
+        size_t length = 0;
+    };
+
+    int                     camera_fd = -1;
+    struct v4l2_capability  cap;
+    struct v4l2_fmtdesc     fmtdesc;
+    struct v4l2_frmsizeenum frmsize;
+    struct v4l2_frmivalenum frmival;
+    struct v4l2_format      v4l2fmt;
+    struct v4l2_streamparm  streamparm;
+    bool                    isStreamingSupport        = false;
+    bool                    isStreamOn                = false;
+    bool                    isMJPEGSupport            = false;
+    bool                    isTargetResolutionSupport = false;
+    bool                    isTargetFpsSupport        = false;
+    MappedBuffer            buffers[camera_params::kMaxMappedBuffers];  // 保存映射后的基地址和长度
+    int                     NumBuffers = 0;                             // 实际请求到的缓冲区数量
 };
 
 struct v4l2CapList
 {
-  bool isMJPEGSupport = false;
-  bool isYUYVSupport = false;
+    bool isMJPEGSupport = false;
+    bool isYUYVSupport  = false;
 };
 
 #endif  // V4L2_CAMERA_H

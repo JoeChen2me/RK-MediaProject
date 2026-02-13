@@ -11,49 +11,44 @@
 #include <cstring>
 #include <iostream>
 
-V4L2_Camera::V4L2_Camera()
-{
-  std::cout << "V4L2_Camera constructor called" << std::endl;
-}
+V4L2_Camera::V4L2_Camera() { std::cout << "V4L2_Camera constructor called" << std::endl; }
 
 V4L2_Camera::~V4L2_Camera()
 {
-  if (camera_fd >= 0)
-  {
-    close_camera();
-  }
-  std::cout << "V4L2_Camera destructor called" << std::endl;
+    if (camera_fd >= 0)
+    {
+        capture_stream_switch(false);  // 停止流式捕获
+        deinit_camera_buffer();        // 解除缓冲区映射
+        close_camera();                // 关闭摄像头设备
+    }
+    std::cout << "V4L2_Camera destructor called" << std::endl;
 }
 
 int V4L2_Camera::open_camera(const char* device)
 {
-  if (device == nullptr)
-  {
-    std::cerr << "Camera device path is null" << std::endl;
-    return -1;
-  }
+    if (device == nullptr)
+    {
+        std::cerr << "Camera device path is null" << std::endl;
+        return -1;
+    }
 
-  if (camera_fd >= 0)
-  {
-    std::cout << "Camera already opened: fd=" << camera_fd << std::endl;
+    if (camera_fd >= 0)
+    {
+        std::cout << "Camera already opened: fd=" << camera_fd << std::endl;
+        return 0;
+    }
+
+    std::cout << "Opening camera device: " << device << std::endl;
+    camera_fd = open(device, O_RDWR);
+    if (camera_fd < 0)
+    {
+        std::cerr << "Failed to open " << device << ": " << std::strerror(errno) << std::endl;
+        return -1;
+    }
     return 0;
-  }
-
-  std::cout << "Opening camera device: " << device << std::endl;
-  camera_fd = open(device, O_RDWR);
-  if (camera_fd < 0)
-  {
-    std::cerr << "Failed to open " << device << ": " << std::strerror(errno)
-              << std::endl;
-    return -1;
-  }
-  return 0;
 }
 
-int V4L2_Camera::open_camera(const std::string& device)
-{
-  return open_camera(device.c_str());
-}
+int V4L2_Camera::open_camera(const std::string& device) { return open_camera(device.c_str()); }
 
 /**
  * @brief Checks the capabilities of the opened camera device.
@@ -61,176 +56,180 @@ int V4L2_Camera::open_camera(const std::string& device)
  */
 int V4L2_Camera::check_cameraCapabilities()
 {
-  if (camera_fd < 0)
-  {
-    std::cerr << "Camera is not opened" << std::endl;
-    return -1;
-  }
-
-  // Reset cached capability flags for every fresh check.
-  isMJPEGSupport = false;
-  is640x480Support = false;
-  is30fpsSupport = false;
-
-  if (ioctl(camera_fd, VIDIOC_QUERYCAP, &cap) < 0)
-  {
-    std::cerr << "Failed to query camera capabilities: " << std::strerror(errno)
-              << std::endl;
-    return -1;
-  }
-  std::cout << "Camera Capabilities:" << std::endl;
-  std::cout << "  Driver: " << cap.driver << std::endl;
-  std::cout << "  Card: " << cap.card << std::endl;
-  std::cout << "  Bus Info: " << cap.bus_info << std::endl;
-  std::cout << "  Version: " << ((cap.version >> 16) & 0xFF) << "."
-            << ((cap.version >> 8) & 0xFF) << "." << (cap.version & 0xFF)
-            << std::endl;
-  // 检查视频输出的支持
-  if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
-  {
-    std::cerr << "Camera does not support video capture" << std::endl;
-    return -1;
-  }
-  // 检查输出格式的支持
-  std::memset(&fmtdesc, 0, sizeof(fmtdesc));
-  fmtdesc.index = 0;
-  fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  while (ioctl(camera_fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0)
-  {
-    fmtdesc.index++;
-    if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG)
+    if (camera_fd < 0)
     {
-      std::cout << "    - Supported format: MJPEG" << std::endl;
-      this->isMJPEGSupport = true;
+        std::cerr << "Camera is not opened" << std::endl;
+        return -1;
     }
-  }
-  if (this->isMJPEGSupport == false)
-  {
-    std::cerr << "Camera does not support MJPEG format" << std::endl;
-    return -1;
-  }
-  // 基于 MJPEG 格式设置分辨率为 640x480
-  std::memset(&frmsize, 0, sizeof(frmsize));
-  frmsize.index = 0;
-  // frmsize.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 这里不需要设置 type，因为我们在
-  // ioctl 调用中已经指定了类型
-  frmsize.pixel_format = V4L2_PIX_FMT_MJPEG;
-  while (ioctl(camera_fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0)
-  {
-    frmsize.index++;
-    if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE)
-    {
-      //   std::cout << "    - Supported resolution: " << frmsize.discrete.width
-      //             << "x" << frmsize.discrete.height << std::endl;
-      if (frmsize.discrete.width == 640 && frmsize.discrete.height == 480)
-      {
-        std::cout << "    - Supported resolution: " << frmsize.discrete.width
-                  << "x" << frmsize.discrete.height << std::endl;
-        this->is640x480Support = true;
-      }
-    }
-  }
-  if (this->is640x480Support == false)
-  {
-    std::cerr << "Camera does not support 640x480 resolution" << std::endl;
-    return -1;
-  }
 
-  // 基于 MJPEG 格式和 640x480 分辨率设置帧率为 30fps
-  std::memset(&frmival, 0, sizeof(frmival));
-  frmival.index = 0;
-  frmival.pixel_format = V4L2_PIX_FMT_MJPEG;
-  frmival.width = 640;
-  frmival.height = 480;
-  while (ioctl(camera_fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0)
-  {
-    frmival.index++;
-    if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE)
-    {
-      double fps = static_cast<double>(frmival.discrete.denominator) /
-                   frmival.discrete.numerator;  // 分母除分子得到帧率
-      //   std::cout << "    - Supported frame rate: " << fps << " fps" <<
-      //   std::endl;
-      if (std::abs(fps - 30.0) < 0.01)  // 考虑浮点数计算的误差
-      {
-        std::cout << "    - Supported frame rate: " << fps << " fps"
-                  << std::endl;
-        this->is30fpsSupport = true;
-      }
-    }
-  }
-  if (this->is30fpsSupport == false)
-  {
-    std::cerr
-        << "Camera does not support 30fps frame rate at 640x480 resolution"
-        << std::endl;
-    return -1;
-  }
+    // Reset cached capability flags for every fresh check.
+    isStreamingSupport        = false;
+    isStreamOn                = false;
+    isMJPEGSupport            = false;
+    isTargetResolutionSupport = false;
+    isTargetFpsSupport        = false;
 
-  // 开始设置
-  std::memset(&v4l2fmt, 0, sizeof(v4l2fmt));
-  v4l2fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  v4l2fmt.fmt.pix.width = 640;
-  v4l2fmt.fmt.pix.height = 480;
-  v4l2fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
-  v4l2fmt.fmt.pix.field = V4L2_FIELD_NONE;  // 设置为逐行扫描
-  if (ioctl(camera_fd, VIDIOC_S_FMT, &v4l2fmt) < 0)
-  {
-    std::cerr << "Failed to set pixel format: " << std::strerror(errno)
-              << std::endl;
-    return -1;
-  }
-  // 检查返回值是否符合预期
-  if (v4l2fmt.fmt.pix.width != 640 || v4l2fmt.fmt.pix.height != 480 ||
-      v4l2fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG)
-  {
-    std::cerr << "Camera did not accept the requested format" << std::endl;
-    return -1;
-  }
-  // 确认是否支持设置帧率
-  std::memset(&streamparm, 0, sizeof(streamparm));
-  streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  if (ioctl(camera_fd, VIDIOC_G_PARM, &streamparm) < 0)
-  {
-    std::cerr << "Failed to get stream parameters: " << std::strerror(errno)
-              << std::endl;
-    return -1;
-  }
-  if (!(streamparm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME))
-  {
-    std::cerr << "Camera does not support setting frame rate" << std::endl;
-    return -1;
-  }
-  // 支持帧率设置 开始设置帧率
-  std::memset(&streamparm, 0, sizeof(streamparm));
-  streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  streamparm.parm.capture.timeperframe.numerator = 1;     // 分子
-  streamparm.parm.capture.timeperframe.denominator = 30;  // 分母
-  if (ioctl(camera_fd, VIDIOC_S_PARM, &streamparm) < 0)
-  {
-    std::cerr << "Failed to set frame rate: " << std::strerror(errno)
-              << std::endl;
-    return -1;
-  }
-  // 检查设置结果 想做“二次确认”或兼容某些实现不规范的驱动，再额外 G_PARM
-  // 一次也可以，但不是必需的
-  if (streamparm.parm.capture.timeperframe.numerator == 0)
-  {
-    std::cerr << "Invalid frame rate returned by driver" << std::endl;
-    return -1;
-  }
-  double fpsActual =
-      static_cast<double>(streamparm.parm.capture.timeperframe.denominator) /
-      streamparm.parm.capture.timeperframe.numerator;
-  if (std::abs(fpsActual - 30.0) > 0.1)
-  {
-    std::cerr << "Camera did not accept the requested frame rate"
-              << " (actual: " << fpsActual << " fps)" << std::endl;
-    return -1;
-  }
-  std::cout << "Camera capabilities check passed.\nCamera Init Done "
-            << std::endl;
-  return 0;
+    if (ioctl(camera_fd, VIDIOC_QUERYCAP, &cap) < 0)
+    {
+        std::cerr << "Failed to query camera capabilities: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+    std::cout << "Camera Capabilities:" << std::endl;
+    std::cout << "  Driver: " << cap.driver << std::endl;
+    std::cout << "  Card: " << cap.card << std::endl;
+    std::cout << "  Bus Info: " << cap.bus_info << std::endl;
+    std::cout << "  Version: " << ((cap.version >> 16) & 0xFF) << "." << ((cap.version >> 8) & 0xFF)
+              << "." << (cap.version & 0xFF) << std::endl;
+    // 检查视频输出的支持
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
+    {
+        std::cerr << "Camera does not support video capture" << std::endl;
+        return -1;
+    }
+    if (!(cap.capabilities & V4L2_CAP_STREAMING))
+    {
+        std::cerr << "Camera does not support streaming I/O" << std::endl;
+        return -1;
+    }
+    this->isStreamingSupport = true;  // 标记支持流式传输
+    // 检查输出格式的支持
+    std::memset(&fmtdesc, 0, sizeof(fmtdesc));
+    fmtdesc.index = 0;
+    fmtdesc.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    while (ioctl(camera_fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0)
+    {
+        fmtdesc.index++;
+        if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG)
+        {
+            std::cout << "    - Supported format: MJPEG" << std::endl;
+            this->isMJPEGSupport = true;
+        }
+    }
+    if (this->isMJPEGSupport == false)
+    {
+        std::cerr << "Camera does not support MJPEG format" << std::endl;
+        return -1;
+    }
+    // 基于 MJPEG 格式设置分辨率
+    std::memset(&frmsize, 0, sizeof(frmsize));
+    frmsize.index = 0;
+    // frmsize.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 这里不需要设置 type，因为我们在
+    // ioctl 调用中已经指定了类型
+    frmsize.pixel_format = V4L2_PIX_FMT_MJPEG;
+    while (ioctl(camera_fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0)
+    {
+        frmsize.index++;
+        if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE)
+        {
+            //   std::cout << "    - Supported resolution: " << frmsize.discrete.width
+            //             << "x" << frmsize.discrete.height << std::endl;
+            if (frmsize.discrete.width == camera_params::kCaptureWidth &&
+                frmsize.discrete.height == camera_params::kCaptureHeight)
+            {
+                std::cout << "    - Supported resolution: " << frmsize.discrete.width << "x"
+                          << frmsize.discrete.height << std::endl;
+                this->isTargetResolutionSupport = true;
+            }
+        }
+    }
+    if (this->isTargetResolutionSupport == false)
+    {
+        std::cerr << "Camera does not support " << camera_params::kCaptureWidth << "x"
+                  << camera_params::kCaptureHeight << " resolution" << std::endl;
+        return -1;
+    }
+
+    // 基于 MJPEG 格式和目标分辨率设置帧率
+    std::memset(&frmival, 0, sizeof(frmival));
+    frmival.index        = 0;
+    frmival.pixel_format = V4L2_PIX_FMT_MJPEG;
+    frmival.width        = camera_params::kCaptureWidth;
+    frmival.height       = camera_params::kCaptureHeight;
+    while (ioctl(camera_fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0)
+    {
+        frmival.index++;
+        if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE)
+        {
+            double fps = static_cast<double>(frmival.discrete.denominator) /
+                         frmival.discrete.numerator;  // 分母除分子得到帧率
+            //   std::cout << "    - Supported frame rate: " << fps << " fps" <<
+            //   std::endl;
+            if (std::abs(fps - static_cast<double>(camera_params::kCaptureFps)) <
+                0.01)  // 考虑浮点数计算的误差
+            {
+                std::cout << "    - Supported frame rate: " << fps << " fps" << std::endl;
+                this->isTargetFpsSupport = true;
+            }
+        }
+    }
+    if (this->isTargetFpsSupport == false)
+    {
+        std::cerr << "Camera does not support " << camera_params::kCaptureFps
+                  << "fps frame rate at " << camera_params::kCaptureWidth << "x"
+                  << camera_params::kCaptureHeight << " resolution" << std::endl;
+        return -1;
+    }
+
+    // 开始设置
+    std::memset(&v4l2fmt, 0, sizeof(v4l2fmt));
+    v4l2fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    v4l2fmt.fmt.pix.width       = camera_params::kCaptureWidth;
+    v4l2fmt.fmt.pix.height      = camera_params::kCaptureHeight;
+    v4l2fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+    v4l2fmt.fmt.pix.field       = V4L2_FIELD_NONE;  // 设置为逐行扫描
+    if (ioctl(camera_fd, VIDIOC_S_FMT, &v4l2fmt) < 0)
+    {
+        std::cerr << "Failed to set pixel format: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+    // 检查返回值是否符合预期
+    if (v4l2fmt.fmt.pix.width != camera_params::kCaptureWidth ||
+        v4l2fmt.fmt.pix.height != camera_params::kCaptureHeight ||
+        v4l2fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG)
+    {
+        std::cerr << "Camera did not accept the requested format" << std::endl;
+        return -1;
+    }
+    // 确认是否支持设置帧率
+    std::memset(&streamparm, 0, sizeof(streamparm));
+    streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(camera_fd, VIDIOC_G_PARM, &streamparm) < 0)
+    {
+        std::cerr << "Failed to get stream parameters: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+    if (!(streamparm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME))
+    {
+        std::cerr << "Camera does not support setting frame rate" << std::endl;
+        return -1;
+    }
+    // 支持帧率设置 开始设置帧率
+    std::memset(&streamparm, 0, sizeof(streamparm));
+    streamparm.type                                  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    streamparm.parm.capture.timeperframe.numerator   = 1;                           // 分子
+    streamparm.parm.capture.timeperframe.denominator = camera_params::kCaptureFps;  // 分母
+    if (ioctl(camera_fd, VIDIOC_S_PARM, &streamparm) < 0)
+    {
+        std::cerr << "Failed to set frame rate: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+    // 检查设置结果 想做“二次确认”或兼容某些实现不规范的驱动，再额外 G_PARM
+    // 一次也可以，但不是必需的
+    if (streamparm.parm.capture.timeperframe.numerator == 0)
+    {
+        std::cerr << "Invalid frame rate returned by driver" << std::endl;
+        return -1;
+    }
+    double fpsActual = static_cast<double>(streamparm.parm.capture.timeperframe.denominator) /
+                       streamparm.parm.capture.timeperframe.numerator;
+    if (std::abs(fpsActual - static_cast<double>(camera_params::kCaptureFps)) > 0.1)
+    {
+        std::cerr << "Camera did not accept the requested frame rate"
+                  << " (actual: " << fpsActual << " fps)" << std::endl;
+        return -1;
+    }
+    std::cout << "Camera capabilities check passed.\nCamera Init Done " << std::endl;
+    return 0;
 }
 
 /**
@@ -245,102 +244,350 @@ int V4L2_Camera::check_cameraCapabilities()
  */
 int V4L2_Camera::set_exposure_time(int exposure_time_ms)
 {
-  if (camera_fd < 0)
-  {
-    std::cerr << "Camera is not opened" << std::endl;
-    return -1;
-  }
-
-  if (exposure_time_ms < 0)
-  {
-    std::cerr << "Invalid exposure time: " << exposure_time_ms
-              << " ms (must be >= 0)" << std::endl;
-    return -1;
-  }
-
-  if (exposure_time_ms == 0)
-  {
-    v4l2_control auto_ctrl{};
-    auto_ctrl.id = V4L2_CID_EXPOSURE_AUTO;
-    auto_ctrl.value = V4L2_EXPOSURE_AUTO;
-    if (ioctl(camera_fd, VIDIOC_S_CTRL, &auto_ctrl) < 0)
+    if (camera_fd < 0)
     {
-      std::cerr << "Failed to set auto exposure mode: " << std::strerror(errno)
-                << std::endl;
-      return -1;
+        std::cerr << "Camera is not opened" << std::endl;
+        return -1;
     }
 
-    std::cout << "Exposure mode set to auto" << std::endl;
+    if (exposure_time_ms < 0)
+    {
+        std::cerr << "Invalid exposure time: " << exposure_time_ms << " ms (must be >= 0)"
+                  << std::endl;
+        return -1;
+    }
+
+    if (exposure_time_ms == 0)
+    {
+        v4l2_control auto_ctrl{};
+        auto_ctrl.id    = V4L2_CID_EXPOSURE_AUTO;
+        auto_ctrl.value = V4L2_EXPOSURE_AUTO;
+        if (ioctl(camera_fd, VIDIOC_S_CTRL, &auto_ctrl) < 0)
+        {
+            std::cerr << "Failed to set auto exposure mode: " << std::strerror(errno) << std::endl;
+            return -1;
+        }
+
+        std::cout << "Exposure mode set to auto" << std::endl;
+        return 0;
+    }
+
+    // Most UVC drivers use V4L2_CID_EXPOSURE_ABSOLUTE in 100us units.
+    const int exposure_100us = exposure_time_ms * 10;
+
+    v4l2_control auto_ctrl{};
+    auto_ctrl.id    = V4L2_CID_EXPOSURE_AUTO;
+    auto_ctrl.value = V4L2_EXPOSURE_MANUAL;
+    if (ioctl(camera_fd, VIDIOC_S_CTRL, &auto_ctrl) < 0)
+    {
+        std::cerr << "Failed to set manual exposure mode: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+
+    v4l2_queryctrl query{};
+    query.id = V4L2_CID_EXPOSURE_ABSOLUTE;
+    if (ioctl(camera_fd, VIDIOC_QUERYCTRL, &query) < 0)
+    {
+        std::cerr << "Failed to query exposure range: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+
+    if (query.flags & V4L2_CTRL_FLAG_DISABLED)
+    {
+        std::cerr << "Exposure control is disabled by driver" << std::endl;
+        return -1;
+    }
+
+    if (exposure_100us < query.minimum || exposure_100us > query.maximum)
+    {
+        std::cerr << "Exposure out of range: " << exposure_time_ms << " ms"
+                  << " (supported " << (query.minimum / 10.0) << "-" << (query.maximum / 10.0)
+                  << " ms)" << std::endl;
+        return -1;
+    }
+
+    v4l2_control exp_ctrl{};
+    exp_ctrl.id    = V4L2_CID_EXPOSURE_ABSOLUTE;
+    exp_ctrl.value = exposure_100us;
+    if (ioctl(camera_fd, VIDIOC_S_CTRL, &exp_ctrl) < 0)
+    {
+        std::cerr << "Failed to set exposure time: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+
+    std::cout << "Exposure time set to " << exposure_time_ms << " ms" << std::endl;
     return 0;
-  }
+}
 
-  // Most UVC drivers use V4L2_CID_EXPOSURE_ABSOLUTE in 100us units.
-  const int exposure_100us = exposure_time_ms * 10;
+int V4L2_Camera::init_camera_buffer()
+{
+    // 基础检查
+    if (camera_fd == -1)
+    {
+        std::cerr << "Camera is not opened" << std::endl;
+        return -1;
+    }
+    if (this->isStreamingSupport == false)
+    {
+        std::cerr << "Camera does not support streaming I/O" << std::endl;
+        return -1;
+    }
+    if (NumBuffers > 0)
+    {
+        std::cerr << "Camera buffers already initialized" << std::endl;
+        return -1;
+    }
 
-  v4l2_control auto_ctrl{};
-  auto_ctrl.id = V4L2_CID_EXPOSURE_AUTO;
-  auto_ctrl.value = V4L2_EXPOSURE_MANUAL;
-  if (ioctl(camera_fd, VIDIOC_S_CTRL, &auto_ctrl) < 0)
-  {
-    std::cerr << "Failed to set manual exposure mode: " << std::strerror(errno)
+    NumBuffers = 0;
+    for (auto& mapped : buffers)
+    {
+        mapped.base   = nullptr;
+        mapped.length = 0;
+    }
+
+    // 请求缓冲区
+    struct v4l2_requestbuffers reqbuf{};
+    reqbuf.count  = camera_params::kRequestBufferCount;  // 请求缓冲区数量
+    reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;         // 视频捕获类型
+    reqbuf.memory = V4L2_MEMORY_MMAP;                    // 使用内存映射方式
+    if (ioctl(camera_fd, VIDIOC_REQBUFS, &reqbuf) < 0)   // 请求缓冲区
+    {
+        std::cerr << "Failed to request buffers: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+    if (reqbuf.count == 0)
+    {
+        std::cerr << "Driver returned zero capture buffers" << std::endl;
+        return -1;
+    }
+    // 查询缓冲区，将其映射到用户空间，并保存映射后的基地址以供后续使用
+    struct v4l2_buffer buffer{};
+    buffer.index  = 0;                                       // 缓冲区索引，从0开始
+    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;             /// 视频捕获类型
+    buffer.memory = V4L2_MEMORY_MMAP;                        // 使用内存映射方式
+    while (ioctl(camera_fd, VIDIOC_QUERYBUF, &buffer) == 0)  // 查询每个缓冲区的信息
+    {
+        if (buffer.index >= camera_params::kMaxMappedBuffers)
+        {
+            std::cerr << "Too many buffers from driver: " << buffer.index << std::endl;
+            return -1;
+        }
+
+        void* buffer_start = mmap(nullptr, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                  camera_fd, buffer.m.offset);  // 映射缓冲区到用户空间
+        if (buffer_start == MAP_FAILED)
+        {
+            std::cerr << "Failed to mmap buffer: " << std::strerror(errno) << std::endl;
+            for (int i = 0; i < this->NumBuffers; i++)
+            {
+                if (buffers[i].base != nullptr && buffers[i].length > 0)
+                {
+                    munmap(buffers[i].base, buffers[i].length);
+                    buffers[i].base   = nullptr;
+                    buffers[i].length = 0;
+                }
+            }
+            NumBuffers = 0;
+            return -1;
+        }
+        // std::cout << "Buffer " << buffer.index << ": length=" << buffer.length
+        //           << ", offset=" << buffer.m.offset << std::endl;
+        // 将映射后的基地址和长度保存到类的私有成员中，供后续取帧/解除映射使用。
+        buffers[buffer.index].base   = buffer_start;
+        buffers[buffer.index].length = buffer.length;
+        buffer.index++;      // 查询下一个缓冲区
+        this->NumBuffers++;  // 统计实际请求到的缓冲区数量
+    }
+    if (this->NumBuffers <= 0)
+    {
+        std::cerr << "No valid mapped buffers available" << std::endl;
+        return -1;
+    }
+    // 将所有缓冲区入队，准备开始捕获
+    memset(&buffer, 0, sizeof(buffer));           /// 重置结构体以避免潜在的垃圾数据
+    buffer.index  = 0;                            // 从第一个缓冲区开始入队
+    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;  /// 视频捕获类型
+    buffer.memory = V4L2_MEMORY_MMAP;             // 使用内存映射
+    for (int i = 0; i < this->NumBuffers; i++)
+    {
+        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 入队缓冲区
+        {
+            std::cerr << "Failed to queue buffer " << buffer.index << ": " << std::strerror(errno)
+                      << std::endl;
+            return -1;
+        }
+        buffer.index++;  // 入队下一个缓冲区
+    }
+    return 0;
+}
+
+int V4L2_Camera::deinit_camera_buffer()
+{
+    if (camera_fd < 0)
+    {
+        std::cerr << "Camera is not opened" << std::endl;
+        return -1;
+    }
+    if (this->isStreamingSupport == false)
+    {
+        std::cerr << "Camera does not support streaming I/O" << std::endl;
+        return -1;
+    }
+    for (int i = 0; i < this->NumBuffers; i++)
+    {
+        if (buffers[i].base != nullptr && buffers[i].length > 0)
+        {
+            if (munmap(buffers[i].base, buffers[i].length) != 0)
+            {
+                std::cerr << "Failed to munmap buffer " << i << ": " << std::strerror(errno)
+                          << std::endl;
+                return -1;
+            }
+            buffers[i].base   = nullptr;
+            buffers[i].length = 0;
+        }
+    }
+    NumBuffers = 0;
+    return 0;
+}
+
+int V4L2_Camera::capture_stream_switch(bool enabled)
+{
+    if (camera_fd < 0)
+    {
+        std::cerr << "Camera is not opened" << std::endl;
+        return -1;
+    }
+    if (this->isStreamingSupport == false)
+    {
+        std::cerr << "Camera does not support streaming I/O" << std::endl;
+        return -1;
+    }
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;  // 视频捕获类型
+    if (enabled)
+    {
+        if (isStreamOn)
+        {
+            return 0;
+        }
+        if (ioctl(camera_fd, VIDIOC_STREAMON, &type) < 0)  // 开始流式捕获
+        {
+            std::cerr << "Failed to start streaming: " << std::strerror(errno) << std::endl;
+            return -1;
+        }
+        isStreamOn = true;
+        std::cout << "Streaming started" << std::endl;
+    }
+    else
+    {
+        if (!isStreamOn)
+        {
+            return 0;
+        }
+        if (ioctl(camera_fd, VIDIOC_STREAMOFF, &type) < 0)  // 停止流式捕获
+        {
+            std::cerr << "Failed to stop streaming: " << std::strerror(errno) << std::endl;
+            return -1;
+        }
+        isStreamOn = false;
+        std::cout << "Streaming stopped" << std::endl;
+    }
+    return 0;
+}
+
+int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length)
+{
+    // 基础检查
+    if (camera_fd < 0)
+    {
+        std::cerr << "Camera is not opened" << std::endl;
+        return -1;
+    }
+    if (this->isStreamingSupport == false)
+    {
+        std::cerr << "Camera does not support streaming I/O" << std::endl;
+        return -1;
+    }
+    if (!isStreamOn)
+    {
+        std::cerr << "Camera stream is not started" << std::endl;
+        return -1;
+    }
+    if (out_buffer == nullptr || out_length == nullptr)
+    {
+        std::cerr << "Invalid output buffer arguments" << std::endl;
+        return -1;
+    }
+    // 从内核队列中取出一帧数据
+    struct v4l2_buffer buffer{};
+    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;      // 视频捕获类型
+    buffer.memory = V4L2_MEMORY_MMAP;                 // 使用内存映射方式
+    if (ioctl(camera_fd, VIDIOC_DQBUF, &buffer) < 0)  // 从内核队列中取出一帧数据
+    {
+        std::cerr << "Failed to dequeue buffer: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+    if (static_cast<int>(buffer.index) >= this->NumBuffers)
+    {
+        std::cerr << "Invalid buffer index dequeued: " << buffer.index << std::endl;
+        return -1;
+    }
+
+    if (buffer.bytesused > *out_length)
+    {
+        std::cerr << "Output buffer too small, required: " << buffer.bytesused
+                  << ", provided: " << *out_length << std::endl;
+        *out_length = buffer.bytesused;
+        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)
+        {
+            std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
+        }
+        return -1;
+    }
+
+    if (buffers[buffer.index].base == nullptr)
+    {
+        std::cerr << "Mapped buffer base is null for index: " << buffer.index << std::endl;
+        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)
+        {
+            std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
+        }
+        return -1;
+    }
+
+    std::cout << "Dequeued buffer index: " << buffer.index << ", bytes used: " << buffer.bytesused
               << std::endl;
-    return -1;
-  }
+    // 将取出的帧数据复制到用户提供的输出缓冲区中
+    std::memcpy(out_buffer, buffers[buffer.index].base, buffer.bytesused);
+    *out_length = buffer.bytesused;
 
-  v4l2_queryctrl query{};
-  query.id = V4L2_CID_EXPOSURE_ABSOLUTE;
-  if (ioctl(camera_fd, VIDIOC_QUERYCTRL, &query) < 0)
-  {
-    std::cerr << "Failed to query exposure range: " << std::strerror(errno)
-              << std::endl;
-    return -1;
-  }
-
-  if (query.flags & V4L2_CTRL_FLAG_DISABLED)
-  {
-    std::cerr << "Exposure control is disabled by driver" << std::endl;
-    return -1;
-  }
-
-  if (exposure_100us < query.minimum || exposure_100us > query.maximum)
-  {
-    std::cerr << "Exposure out of range: " << exposure_time_ms << " ms"
-              << " (supported " << (query.minimum / 10.0) << "-"
-              << (query.maximum / 10.0) << " ms)" << std::endl;
-    return -1;
-  }
-
-  v4l2_control exp_ctrl{};
-  exp_ctrl.id = V4L2_CID_EXPOSURE_ABSOLUTE;
-  exp_ctrl.value = exposure_100us;
-  if (ioctl(camera_fd, VIDIOC_S_CTRL, &exp_ctrl) < 0)
-  {
-    std::cerr << "Failed to set exposure time: " << std::strerror(errno)
-              << std::endl;
-    return -1;
-  }
-
-  std::cout << "Exposure time set to " << exposure_time_ms << " ms"
-            << std::endl;
-  return 0;
+    // 将帧重新入队，要让驱动知道三个信息，分别是：缓冲区索引、缓冲区类型、内存类型
+    if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
+    {
+        std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
+        return -1;
+    }
+    return 0;
 }
 
 int V4L2_Camera::close_camera()
 {
-  if (camera_fd < 0)
-  {
-    std::cout << "Camera already closed" << std::endl;
+    if (camera_fd < 0)
+    {
+        std::cout << "Camera already closed" << std::endl;
+        return 0;
+    }
+
+    std::cout << "Closing camera device: fd=" << camera_fd << std::endl;
+    if (close(camera_fd) != 0)
+    {
+        std::cerr << "Failed to close camera fd=" << camera_fd << ": " << std::strerror(errno)
+                  << std::endl;
+        return -1;
+    }
+
+    camera_fd  = -1;
+    isStreamOn = false;
+    NumBuffers = 0;
     return 0;
-  }
-
-  std::cout << "Closing camera device: fd=" << camera_fd << std::endl;
-  if (close(camera_fd) != 0)
-  {
-    std::cerr << "Failed to close camera fd=" << camera_fd << ": "
-              << std::strerror(errno) << std::endl;
-    return -1;
-  }
-
-  camera_fd = -1;
-  return 0;
 }
