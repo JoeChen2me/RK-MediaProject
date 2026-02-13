@@ -1,4 +1,12 @@
 {
   "C_Cpp.debugShortcut": false,
-  "cmake.buildBeforeRun": true
+  "cmake.buildBeforeRun": true,
+  "editor.wordWrapColumn": 120,
+  "editor.wordWrap": "wordWrapColumn",
+  "editor.formatOnSave": true,
+  "[cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools"
+  },
+  "C_Cpp.formatting": "clangFormat",
+  "C_Cpp.clang_format_style": "{ BasedOnStyle: Google, BreakBeforeBraces: Allman }"
 }
