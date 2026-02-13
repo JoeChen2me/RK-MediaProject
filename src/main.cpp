@@ -16,5 +16,6 @@ int main() {
         return 1;
     }
 
+    std::cout << "Camera opened and closed successfully" << std::endl;
     return 0;
 }
