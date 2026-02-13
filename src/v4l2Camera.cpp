@@ -11,49 +11,99 @@
 #include <cstring>
 #include <iostream>
 
-V4L2_Camera::V4L2_Camera() { std::cout << "V4L2_Camera constructor called" << std::endl; }
+V4L2_Camera::V4L2_Camera()
+{
+    // std::cout << "V4L2_Camera constructor called" << std::endl;
+}
 
 V4L2_Camera::~V4L2_Camera()
 {
-    if (camera_fd >= 0)
+    if (isStreamOn)
     {
         capture_stream_switch(false);  // 停止流式捕获
-        deinit_camera_buffer();        // 解除缓冲区映射
-        close_camera();                // 关闭摄像头设备
     }
-    std::cout << "V4L2_Camera destructor called" << std::endl;
+    if (NumBuffers > 0)
+    {
+        deinit_camera_buffer();  // 解除缓冲区映射
+    }
+    if (camera_fd >= 0)
+    {
+        close_camera();  // 关闭摄像头设备
+    }
+    // std::cout << "V4L2_Camera destructor called" << std::endl;
 }
 
 int V4L2_Camera::camera_GlobalInit(const std::string& device, const int exposureMs)
 {
+    if (camera_fd >= 0 || NumBuffers > 0 || isStreamOn)
+    {
+        std::cerr
+            << "Camera is already initialized, please recreate object before re-initialization"
+            << std::endl;
+        return -1;
+    }
+
+    bool opened        = false;
+    bool buffersInited = false;
+    bool streamStarted = false;
+
     if (open_camera(device) != 0)
     {
         std::cerr << "Failed to open camera during global initialization" << std::endl;
-        return -1;
+        goto fail;
     }
+    opened = true;
+
     if (check_cameraCapabilities() != 0)
     {
         std::cerr << "Camera does not meet the required capabilities during global initialization"
                   << std::endl;
-        return -1;
+        goto fail;
     }
+
     if (init_camera_buffer() != 0)
     {
         std::cerr << "Failed to initialize camera buffers during global initialization"
                   << std::endl;
-        return -1;
+        goto fail;
     }
+    buffersInited = true;
+
     if (set_exposure_time(exposureMs) != 0)
     {
         std::cerr << "Failed to set exposure time during global initialization" << std::endl;
-        return -1;
+        goto fail;
     }
+
     if (capture_stream_switch(true) != 0)
     {
         std::cerr << "Failed to start streaming capture during global initialization" << std::endl;
-        return -1;
+        goto fail;
     }
+    streamStarted = true;
+
     return 0;
+
+fail:
+    if (streamStarted)
+    {
+        capture_stream_switch(false);
+    }
+    if (buffersInited)
+    {
+        deinit_camera_buffer();
+    }
+    if (opened && camera_fd >= 0)
+    {
+        if (close(camera_fd) != 0)
+        {
+            std::cerr << "Rollback close failed: " << std::strerror(errno) << std::endl;
+        }
+        camera_fd          = -1;
+        isStreamOn         = false;
+        isStreamingSupport = false;
+    }
+    return -1;
 }
 
 int V4L2_Camera::open_camera(const char* device)
@@ -70,7 +120,7 @@ int V4L2_Camera::open_camera(const char* device)
         return 0;
     }
 
-    std::cout << "Opening camera device: " << device << std::endl;
+    // std::cout << "Opening camera device: " << device << std::endl;
     camera_fd = open(device, O_RDWR);
     if (camera_fd < 0)
     {
@@ -109,9 +159,10 @@ int V4L2_Camera::check_cameraCapabilities()
     std::cout << "Camera Capabilities:" << std::endl;
     std::cout << "  Driver: " << cap.driver << std::endl;
     std::cout << "  Card: " << cap.card << std::endl;
-    std::cout << "  Bus Info: " << cap.bus_info << std::endl;
-    std::cout << "  Version: " << ((cap.version >> 16) & 0xFF) << "." << ((cap.version >> 8) & 0xFF)
-              << "." << (cap.version & 0xFF) << std::endl;
+    // std::cout << "  Bus Info: " << cap.bus_info << std::endl;
+    // std::cout << "  Version: " << ((cap.version >> 16) & 0xFF) << "." << ((cap.version >> 8) &
+    // 0xFF)
+    //           << "." << (cap.version & 0xFF) << std::endl;
     // 检查视频输出的支持
     if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
     {
@@ -145,8 +196,7 @@ int V4L2_Camera::check_cameraCapabilities()
     // 基于 MJPEG 格式设置分辨率
     std::memset(&frmsize, 0, sizeof(frmsize));
     frmsize.index = 0;
-    // frmsize.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 这里不需要设置 type，因为我们在
-    // ioctl 调用中已经指定了类型
+    // frmsize.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 这里不需要设置 type，这里的 type 是返回值
     frmsize.pixel_format = V4L2_PIX_FMT_MJPEG;
     while (ioctl(camera_fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0)
     {
@@ -187,7 +237,7 @@ int V4L2_Camera::check_cameraCapabilities()
             //   std::cout << "    - Supported frame rate: " << fps << " fps" <<
             //   std::endl;
             if (std::abs(fps - static_cast<double>(camera_params::kCaptureFps)) <
-                0.01)  // 考虑浮点数计算的误差
+                0.1)  // 考虑浮点数计算的误差
             {
                 std::cout << "    - Supported frame rate: " << fps << " fps" << std::endl;
                 this->isTargetFpsSupport = true;
@@ -371,7 +421,7 @@ int V4L2_Camera::init_camera_buffer()
     }
 
     NumBuffers = 0;
-    for (auto& mapped : buffers)
+    for (auto& mapped : MapBuffers)
     {
         mapped.base   = nullptr;
         mapped.length = 0;
@@ -392,95 +442,85 @@ int V4L2_Camera::init_camera_buffer()
         std::cerr << "Driver returned zero capture buffers" << std::endl;
         return -1;
     }
-    // 查询缓冲区，将其映射到用户空间，并保存映射后的基地址以供后续使用
-    struct v4l2_buffer buffer{};
-    buffer.index  = 0;                                       // 缓冲区索引，从0开始
-    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;             /// 视频捕获类型
-    buffer.memory = V4L2_MEMORY_MMAP;                        // 使用内存映射方式
-    while (ioctl(camera_fd, VIDIOC_QUERYBUF, &buffer) == 0)  // 查询每个缓冲区的信息
+    if (reqbuf.count > camera_params::kMaxMappedBuffers)
     {
-        if (buffer.index >= camera_params::kMaxMappedBuffers)
+        std::cerr << "Driver returned too many buffers: " << reqbuf.count
+                  << ", max supported: " << camera_params::kMaxMappedBuffers << std::endl;
+        return -1;
+    }
+
+    // 按驱动返回的 count 有界遍历，避免把异常当成正常结束
+    for (__u32 i = 0; i < reqbuf.count; ++i)
+    {
+        struct v4l2_buffer buffer{};
+        buffer.index  = i;
+        buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buffer.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(camera_fd, VIDIOC_QUERYBUF, &buffer) < 0)
         {
-            std::cerr << "Too many buffers from driver: " << buffer.index << std::endl;
+            std::cerr << "Failed to query buffer " << i << ": " << std::strerror(errno)
+                      << std::endl;
+            deinit_camera_buffer();
             return -1;
         }
 
         void* buffer_start = mmap(nullptr, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED,
-                                  camera_fd, buffer.m.offset);  // 映射缓冲区到用户空间
+                                  camera_fd, buffer.m.offset);
         if (buffer_start == MAP_FAILED)
         {
-            std::cerr << "Failed to mmap buffer: " << std::strerror(errno) << std::endl;
-            for (int i = 0; i < this->NumBuffers; i++)
-            {
-                if (buffers[i].base != nullptr && buffers[i].length > 0)
-                {
-                    munmap(buffers[i].base, buffers[i].length);
-                    buffers[i].base   = nullptr;
-                    buffers[i].length = 0;
-                }
-            }
-            NumBuffers = 0;
+            std::cerr << "Failed to mmap buffer " << i << ": " << std::strerror(errno) << std::endl;
+            deinit_camera_buffer();
             return -1;
         }
-        // std::cout << "Buffer " << buffer.index << ": length=" << buffer.length
-        //           << ", offset=" << buffer.m.offset << std::endl;
-        // 将映射后的基地址和长度保存到类的私有成员中，供后续取帧/解除映射使用。
-        buffers[buffer.index].base   = buffer_start;
-        buffers[buffer.index].length = buffer.length;
-        buffer.index++;      // 查询下一个缓冲区
-        this->NumBuffers++;  // 统计实际请求到的缓冲区数量
+
+        MapBuffers[i].base   = buffer_start;
+        MapBuffers[i].length = buffer.length;
+        this->NumBuffers++;
     }
-    if (this->NumBuffers <= 0)
-    {
-        std::cerr << "No valid mapped buffers available" << std::endl;
-        return -1;
-    }
+
     // 将所有缓冲区入队，准备开始捕获
-    memset(&buffer, 0, sizeof(buffer));           /// 重置结构体以避免潜在的垃圾数据
-    buffer.index  = 0;                            // 从第一个缓冲区开始入队
-    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;  /// 视频捕获类型
-    buffer.memory = V4L2_MEMORY_MMAP;             // 使用内存映射
     for (int i = 0; i < this->NumBuffers; i++)
     {
-        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 入队缓冲区
+        struct v4l2_buffer buffer{};
+        buffer.index  = static_cast<__u32>(i);
+        buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buffer.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)
         {
             std::cerr << "Failed to queue buffer " << buffer.index << ": " << std::strerror(errno)
                       << std::endl;
             return -1;
         }
-        buffer.index++;  // 入队下一个缓冲区
     }
     return 0;
 }
 
 int V4L2_Camera::deinit_camera_buffer()
 {
-    if (camera_fd < 0)
+    if (this->NumBuffers <= 0)
     {
-        std::cerr << "Camera is not opened" << std::endl;
-        return -1;
+        return 0;
     }
-    if (this->isStreamingSupport == false)
-    {
-        std::cerr << "Camera does not support streaming I/O" << std::endl;
-        return -1;
-    }
+
+    int ret = 0;
     for (int i = 0; i < this->NumBuffers; i++)
     {
-        if (buffers[i].base != nullptr && buffers[i].length > 0)
+        if (MapBuffers[i].base != nullptr && MapBuffers[i].length > 0)
         {
-            if (munmap(buffers[i].base, buffers[i].length) != 0)
+            if (munmap(MapBuffers[i].base, MapBuffers[i].length) != 0)
             {
                 std::cerr << "Failed to munmap buffer " << i << ": " << std::strerror(errno)
                           << std::endl;
-                return -1;
+                ret = -1;
             }
-            buffers[i].base   = nullptr;
-            buffers[i].length = 0;
+            MapBuffers[i].base   = nullptr;
+            MapBuffers[i].length = 0;
         }
     }
     NumBuffers = 0;
-    return 0;
+    return ret;
 }
 
 int V4L2_Camera::capture_stream_switch(bool enabled)
@@ -577,7 +617,7 @@ int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length, size_t 
         return -1;
     }
 
-    if (buffers[buffer.index].base == nullptr)
+    if (MapBuffers[buffer.index].base == nullptr)
     {
         std::cerr << "Mapped buffer base is null for index: " << buffer.index << std::endl;
         if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
@@ -590,7 +630,7 @@ int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length, size_t 
     std::cout << "Dequeued buffer index: " << buffer.index << ", bytes used: " << buffer.bytesused
               << std::endl;
     // 将取出的帧数据复制到用户提供的输出缓冲区中
-    std::memcpy(out_buffer, buffers[buffer.index].base, buffer.bytesused);
+    std::memcpy(out_buffer, MapBuffers[buffer.index].base, buffer.bytesused);
     *out_length = buffer.bytesused;
 
     // 将帧重新入队，要让驱动知道三个信息，分别是：缓冲区索引、缓冲区类型、内存类型
@@ -618,8 +658,8 @@ int V4L2_Camera::close_camera()
         return -1;
     }
 
-    camera_fd  = -1;
-    isStreamOn = false;
-    NumBuffers = 0;
+    camera_fd          = -1;
+    isStreamOn         = false;
+    isStreamingSupport = false;
     return 0;
 }

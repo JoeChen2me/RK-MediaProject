@@ -35,9 +35,10 @@ class V4L2_Camera
                           size_t max_buffer_size = camera_params::kMaxFrameSize);  // 读取一帧数据
 
     int set_exposure_time(int exposure_time_ms);
-    int close_camera();
 
    private:
+    int close_camera();  // 仅供析构函数调用，外部不可见
+
     struct MappedBuffer
     {
         void*  base   = nullptr;
@@ -56,8 +57,8 @@ class V4L2_Camera
     bool                    isMJPEGSupport            = false;
     bool                    isTargetResolutionSupport = false;
     bool                    isTargetFpsSupport        = false;
-    MappedBuffer            buffers[camera_params::kMaxMappedBuffers];  // 保存映射后的基地址和长度
-    int                     NumBuffers = 0;                             // 实际请求到的缓冲区数量
+    MappedBuffer MapBuffers[camera_params::kMaxMappedBuffers];  // 保存映射后的基地址和长度
+    int          NumBuffers = 0;                                // 实际请求到的缓冲区数量
 };
 
 struct v4l2CapList
