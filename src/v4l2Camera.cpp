@@ -24,6 +24,38 @@ V4L2_Camera::~V4L2_Camera()
     std::cout << "V4L2_Camera destructor called" << std::endl;
 }
 
+int V4L2_Camera::camera_GlobalInit(const std::string& device, const int exposureMs)
+{
+    if (open_camera(device) != 0)
+    {
+        std::cerr << "Failed to open camera during global initialization" << std::endl;
+        return -1;
+    }
+    if (check_cameraCapabilities() != 0)
+    {
+        std::cerr << "Camera does not meet the required capabilities during global initialization"
+                  << std::endl;
+        return -1;
+    }
+    if (init_camera_buffer() != 0)
+    {
+        std::cerr << "Failed to initialize camera buffers during global initialization"
+                  << std::endl;
+        return -1;
+    }
+    if (set_exposure_time(exposureMs) != 0)
+    {
+        std::cerr << "Failed to set exposure time during global initialization" << std::endl;
+        return -1;
+    }
+    if (capture_stream_switch(true) != 0)
+    {
+        std::cerr << "Failed to start streaming capture during global initialization" << std::endl;
+        return -1;
+    }
+    return 0;
+}
+
 int V4L2_Camera::open_camera(const char* device)
 {
     if (device == nullptr)
@@ -495,7 +527,7 @@ int V4L2_Camera::capture_stream_switch(bool enabled)
     return 0;
 }
 
-int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length)
+int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length, size_t max_buffer_size)
 {
     // 基础检查
     if (camera_fd < 0)
@@ -533,12 +565,12 @@ int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length)
         return -1;
     }
 
-    if (buffer.bytesused > *out_length)
+    if (buffer.bytesused > max_buffer_size)
     {
         std::cerr << "Output buffer too small, required: " << buffer.bytesused
-                  << ", provided: " << *out_length << std::endl;
+                  << ", provided: " << max_buffer_size << std::endl;
         *out_length = buffer.bytesused;
-        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)
+        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
         {
             std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
         }
@@ -548,7 +580,7 @@ int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length)
     if (buffers[buffer.index].base == nullptr)
     {
         std::cerr << "Mapped buffer base is null for index: " << buffer.index << std::endl;
-        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)
+        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
         {
             std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
         }
