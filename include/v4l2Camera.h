@@ -33,6 +33,9 @@ class V4L2_Camera
     int capture_stream_switch(bool enabled);  // 流式捕获开关
     int camera_read_frame(void* out_buffer, size_t* out_length,
                           size_t max_buffer_size = camera_params::kMaxFrameSize);  // 读取一帧数据
+    int dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
+                       const size_t maxBufferSize);  // 从内核中取出一个缓冲区进行读取
+    int requeue_buffer(unsigned int& BufIdx);        // 将一个缓冲区重新放回内核中以供后续使用
 
     int set_exposure_time(int exposure_time_ms);
 

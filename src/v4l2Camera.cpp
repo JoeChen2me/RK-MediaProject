@@ -590,10 +590,43 @@ int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length, size_t 
         std::cerr << "Invalid output buffer arguments" << std::endl;
         return -1;
     }
-    // 从内核队列中取出一帧数据
+    unsigned int bufIdx    = 0;
+    unsigned int frameSize = 0;
+    if (dequeue_buffer(bufIdx, frameSize, max_buffer_size) != 0)
+    {
+        *out_length = frameSize;
+        return -1;
+    }
+    if (MapBuffers[bufIdx].base == nullptr)
+    {
+        std::cerr << "Mapped buffer base is null for index: " << bufIdx << std::endl;
+        if (requeue_buffer(bufIdx) != 0)
+        {
+            std::cerr << "Failed to requeue buffer after null mapped buffer" << std::endl;
+        }
+        return -1;
+    }
+
+    // std::cout << "Dequeued buffer index: " << bufIdx << ", bytes used: " << frameSize <<
+    // std::endl; 将取出的帧数据复制到用户提供的输出缓冲区中
+    std::memcpy(out_buffer, MapBuffers[bufIdx].base, frameSize);
+    *out_length = frameSize;
+
+    if (requeue_buffer(bufIdx) != 0)
+    {
+        std::cerr << "Failed to requeue buffer" << std::endl;
+        return -1;
+    }
+    return 0;
+}
+
+int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
+                                const size_t maxBufferSize)
+{
+    bufferSize = 0;
     struct v4l2_buffer buffer{};
     buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;      // 视频捕获类型
-    buffer.memory = V4L2_MEMORY_MMAP;                 // 使用内存映射方式
+    buffer.memory = V4L2_MEMORY_MMAP;                 // 使用内存映射
     if (ioctl(camera_fd, VIDIOC_DQBUF, &buffer) < 0)  // 从内核队列中取出一帧数据
     {
         std::cerr << "Failed to dequeue buffer: " << std::strerror(errno) << std::endl;
@@ -604,36 +637,29 @@ int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length, size_t 
         std::cerr << "Invalid buffer index dequeued: " << buffer.index << std::endl;
         return -1;
     }
-
-    if (buffer.bytesused > max_buffer_size)
+    bufferSize = buffer.bytesused;
+    if (buffer.bytesused > maxBufferSize)
     {
-        std::cerr << "Output buffer too small, required: " << buffer.bytesused
-                  << ", provided: " << max_buffer_size << std::endl;
-        *out_length = buffer.bytesused;
+        std::cerr << "Buffer size exceeds max allowed size: " << buffer.bytesused << " > "
+                  << maxBufferSize << std::endl;
         if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
         {
             std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
         }
         return -1;
     }
+    // 回传数据
+    BufIdx     = buffer.index;
+    bufferSize = buffer.bytesused;
+    return 0;
+}
 
-    if (MapBuffers[buffer.index].base == nullptr)
-    {
-        std::cerr << "Mapped buffer base is null for index: " << buffer.index << std::endl;
-        if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
-        {
-            std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
-        }
-        return -1;
-    }
-
-    std::cout << "Dequeued buffer index: " << buffer.index << ", bytes used: " << buffer.bytesused
-              << std::endl;
-    // 将取出的帧数据复制到用户提供的输出缓冲区中
-    std::memcpy(out_buffer, MapBuffers[buffer.index].base, buffer.bytesused);
-    *out_length = buffer.bytesused;
-
-    // 将帧重新入队，要让驱动知道三个信息，分别是：缓冲区索引、缓冲区类型、内存类型
+int V4L2_Camera::requeue_buffer(unsigned int& BufIdx)
+{
+    struct v4l2_buffer buffer{};
+    buffer.index  = BufIdx;
+    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;     // 视频捕获类型
+    buffer.memory = V4L2_MEMORY_MMAP;                // 使用内存映射
     if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
     {
         std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
