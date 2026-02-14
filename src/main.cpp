@@ -4,6 +4,7 @@
 #include <errno.h>
 
 #include "v4l2Camera.h"
+#include "rkmpp.h"
 
 const std::string            device      = "/dev/video0";
 static volatile sig_atomic_t should_exit = 0;  // 用于控制程序退出的标志
@@ -25,6 +26,13 @@ int main()
     if (camera.camera_GlobalInit(device, 100) != 0)  // 全局初始化，设置曝光时间为100ms
     {
         std::cerr << "Failed to initialize camera globally" << std::endl;
+        return 1;
+    }
+
+    MppInstance mpp_instance;
+    if (mpp_instance.MppInit() != 0)  // 初始化 MPP 实例
+    {
+        std::cerr << "Failed to initialize MPP instance" << std::endl;
         return 1;
     }
 

@@ -12,19 +12,35 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 add_executable(app
     src/main.cpp
+    src/rkmpp.cpp
     src/v4l2Camera.cpp
     # Examples: add more source files here
     # src/utils/log.cpp
 )
 
-# Use include/ for public headers
-target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Use include/ for public headers + RK MPP/RGA headers
+# RK 平台常见头文件路径：/usr/include/rockchip, /usr/include/rga
+target_include_directories(app PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    /usr/include/rockchip
+    /usr/include/rga
+)
 
 # Example: add compile definitions (macros) if needed later
 # target_compile_definitions(app PRIVATE USE_V4L2=1)
 
 find_package(Threads REQUIRED)
-target_link_libraries(app PRIVATE Threads::Threads v4l2)
+
+# 显式查找 Rockchip MPP / RGA 动态库，便于后续接入解码与图像处理链路
+find_library(ROCKCHIP_MPP_LIB NAMES rockchip_mpp REQUIRED)
+find_library(RGA_LIB NAMES rga REQUIRED)
+
+target_link_libraries(app PRIVATE
+    Threads::Threads
+    v4l2
+    ${ROCKCHIP_MPP_LIB}
+    ${RGA_LIB}
+)
 
 # Keep warnings consistent with tasks.json
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

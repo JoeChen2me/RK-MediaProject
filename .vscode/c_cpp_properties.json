@@ -13,6 +13,8 @@
         "${workspaceFolder}/include",
         "${workspaceFolder}/src",
         "/usr/include",
+        "/usr/include/rockchip",
+        "/usr/include/rga",
         "/usr/local/include"
       ],
       "defines": []
