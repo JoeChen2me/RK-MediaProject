@@ -16,6 +16,12 @@ inline constexpr __u32  kRequestBufferCount = 4;
 inline constexpr size_t kMaxMappedBuffers   = 10;
 }  // namespace camera_params
 
+struct MappedBuffer
+{
+    void*  base   = nullptr;
+    size_t length = 0;
+};
+
 class V4L2_Camera
 {
    public:
@@ -31,22 +37,18 @@ class V4L2_Camera
     int init_camera_buffer();        // 初始化摄像头缓冲区
     int deinit_camera_buffer();      // 反初始化摄像头缓冲区 用于解除映射
     int capture_stream_switch(bool enabled);  // 流式捕获开关
-    int camera_read_frame(void* out_buffer, size_t* out_length,
-                          size_t max_buffer_size = camera_params::kMaxFrameSize);  // 读取一帧数据
+    int camera_read_frame(size_t* out_length,
+                          size_t  max_buffer_size = camera_params::kMaxFrameSize);  // 读取一帧数据
     int dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
                        const size_t maxBufferSize);  // 从内核中取出一个缓冲区进行读取
     int requeue_buffer(unsigned int& BufIdx);        // 将一个缓冲区重新放回内核中以供后续使用
 
-    int set_exposure_time(int exposure_time_ms);
+    int          set_exposure_time(int exposure_time_ms);
+    MappedBuffer MapBuffers[camera_params::kMaxMappedBuffers];  // 保存映射后的基地址和长度
+    unsigned int CurrentBufferIndex = 0;                        // 当前使用的缓冲区索引
 
    private:
     int close_camera();  // 仅供析构函数调用，外部不可见
-
-    struct MappedBuffer
-    {
-        void*  base   = nullptr;
-        size_t length = 0;
-    };
 
     int                     camera_fd = -1;
     struct v4l2_capability  cap;
@@ -60,8 +62,7 @@ class V4L2_Camera
     bool                    isMJPEGSupport            = false;
     bool                    isTargetResolutionSupport = false;
     bool                    isTargetFpsSupport        = false;
-    MappedBuffer MapBuffers[camera_params::kMaxMappedBuffers];  // 保存映射后的基地址和长度
-    int          NumBuffers = 0;                                // 实际请求到的缓冲区数量
+    int                     NumBuffers                = 0;  // 实际请求到的缓冲区数量
 };
 
 struct v4l2CapList

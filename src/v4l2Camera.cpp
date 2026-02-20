@@ -567,7 +567,7 @@ int V4L2_Camera::capture_stream_switch(bool enabled)
     return 0;
 }
 
-int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length, size_t max_buffer_size)
+int V4L2_Camera::camera_read_frame(size_t* out_length, size_t max_buffer_size)
 {
     // 基础检查
     if (camera_fd < 0)
@@ -585,7 +585,7 @@ int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length, size_t 
         std::cerr << "Camera stream is not started" << std::endl;
         return -1;
     }
-    if (out_buffer == nullptr || out_length == nullptr)
+    if (out_length == nullptr)
     {
         std::cerr << "Invalid output buffer arguments" << std::endl;
         return -1;
@@ -609,14 +609,15 @@ int V4L2_Camera::camera_read_frame(void* out_buffer, size_t* out_length, size_t 
 
     // std::cout << "Dequeued buffer index: " << bufIdx << ", bytes used: " << frameSize <<
     // std::endl; 将取出的帧数据复制到用户提供的输出缓冲区中
-    std::memcpy(out_buffer, MapBuffers[bufIdx].base, frameSize);
+    // std::memcpy(out_buffer, MapBuffers[bufIdx].base, frameSize);
     *out_length = frameSize;
 
-    if (requeue_buffer(bufIdx) != 0)
-    {
-        std::cerr << "Failed to requeue buffer" << std::endl;
-        return -1;
-    }
+    // if (requeue_buffer(bufIdx) != 0)
+    // {
+    //     std::cerr << "Failed to requeue buffer" << std::endl;
+    //     return -1;
+    // }
+    CurrentBufferIndex = bufIdx;  // 记录当前使用的缓冲区索引，等待用户处理完后再入队
     return 0;
 }
 

@@ -47,26 +47,30 @@ int main()
         std::cerr << "Failed to allocate MPP buffer group" << std::endl;
         return 1;
     }
-
-    std::vector<unsigned char> frame(
-        camera_params::kMaxFrameSize);  // 用于存储从摄像头读取的一帧数据的缓冲区
     while (!should_exit)
     {
-        size_t frame_length = frame.size();
-        if (camera.camera_read_frame(frame.data(), &frame_length, camera_params::kMaxFrameSize) !=
-            0)
+        size_t frame_length = camera_params::kMaxFrameSize;
+        if (camera.camera_read_frame(&frame_length, camera_params::kMaxFrameSize) != 0)
         {
             std::cerr << "Failed to read a frame from the camera" << std::endl;
             break;
         }
         // 获取到一帧数据后，调用 MPP 解码函数进行解码
-        if (mpp_instance.MppDecode(frame.data(), frame_length) != 0)
+        if (mpp_instance.MppDecode(
+                static_cast<const uint8_t*>(camera.MapBuffers[camera.CurrentBufferIndex].base),
+                frame_length) != 0)
         {
             std::cerr << "Failed to decode the frame using MPP" << std::endl;
             break;
         }
         std::cout << "Frame captured and decoded successfully, length: " << frame_length << " bytes"
                   << std::endl;
+        // 处理完当前帧后，将缓冲区重新入队以供后续使用
+        if (camera.requeue_buffer(camera.CurrentBufferIndex) != 0)
+        {
+            std::cerr << "Failed to requeue buffer after processing frame" << std::endl;
+            break;
+        }
     }
 
     // 依赖析构函数完成资源的回收
