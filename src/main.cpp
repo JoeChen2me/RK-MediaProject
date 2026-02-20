@@ -112,8 +112,24 @@ int main()
                     break;
                 }
 
-                size_t frame_length = camera_params::kMaxFrameSize;
-                if (camera.camera_read_frame(&frame_length, camera_params::kMaxFrameSize) != 0)
+                size_t frame_length      = camera_params::kMaxFrameSize;
+                int    frame_capture_ret = camera.camera_read_frame(&frame_length,
+                                                                  camera_params::kMaxFrameSize);
+                if (frame_capture_ret == camera_read_result::kRetryable)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                if (frame_capture_ret == camera_read_result::kTimeout)
+                {
+                    std::cerr << "Camera dequeue timeout reached ("
+                              << camera_params::kDequeueTimeoutMs
+                              << " ms), stop capture thread" << std::endl;
+                    fatal_error.store(true);
+                    request_stop();
+                    break;
+                }
+                if (frame_capture_ret != camera_read_result::kOk)
                 {
                     std::cerr << "Failed to read a frame from the camera" << std::endl;
                     fatal_error.store(true);
@@ -131,7 +147,7 @@ int main()
                 }
 
                 {
-                    // 将新捕获的帧描述加入 readyQueue，准备被编码线程处理。
+                    // 将新捕获的帧描述加入 readyQueue，准备被解码线程处理。
                     // 扩起来是为了减小持锁作用域，先在锁内检查并更新 readyQueue
                     // 的状态，决定是否需要丢弃最旧的帧，然后在锁外执行具体的入队和丢弃操作。
                     std::lock_guard<std::mutex> lock(ready_mutex);
@@ -159,7 +175,7 @@ int main()
             ready_cv.notify_all();
         });
 
-    std::thread encode_thread(
+    std::thread decode_thread(
         [&]()
         {
             while (true)
@@ -223,10 +239,10 @@ int main()
     {
         capture_thread.join();
     }
-    request_stop();  // 保证编码线程在无任务时也能被唤醒退出
-    if (encode_thread.joinable())
+    request_stop();  // 保证解码线程在无任务时也能被唤醒退出
+    if (decode_thread.joinable())
     {
-        encode_thread.join();
+        decode_thread.join();
     }
 
     // 退出阶段不再执行回队，交由 V4L2 反初始化流程（STREAMOFF + REQBUFS(0)）统一释放。

@@ -16,7 +16,16 @@ inline constexpr __u32  kCaptureFps         = 30;
 inline constexpr size_t kMaxFrameSize       = 1024 * 1024;
 inline constexpr __u32  kRequestBufferCount = 4;
 inline constexpr size_t kMaxMappedBuffers   = 10;
+inline constexpr int    kDequeueTimeoutMs   = 10 * 1000;
 }  // namespace camera_params
+
+namespace camera_read_result
+{
+inline constexpr int kOk        = 0;
+inline constexpr int kRetryable = 1;
+inline constexpr int kTimeout   = 2;
+inline constexpr int kFatal     = -1;
+}  // namespace camera_read_result
 
 class V4L2_Camera
 {

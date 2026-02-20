@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -614,35 +615,36 @@ int V4L2_Camera::capture_stream_switch(bool enabled)
 
 int V4L2_Camera::camera_read_frame(size_t* out_length, size_t max_buffer_size)
 {
-    // 基础检查
     if (camera_fd < 0)
     {
         std::cerr << "Camera is not opened" << std::endl;
-        return -1;
+        return camera_read_result::kFatal;
     }
     if (this->isStreamingSupport == false)
     {
         std::cerr << "Camera does not support streaming I/O" << std::endl;
-        return -1;
+        return camera_read_result::kFatal;
     }
     if (!isStreamOn)
     {
         std::cerr << "Camera stream is not started" << std::endl;
-        return -1;
+        return camera_read_result::kFatal;
     }
     if (out_length == nullptr)
     {
         std::cerr << "Invalid output buffer arguments" << std::endl;
-        return -1;
+        return camera_read_result::kFatal;
     }
+
     CurrentFrameDesc = nullptr;
 
     unsigned int bufIdx    = 0;
     unsigned int frameSize = 0;
-    if (dequeue_buffer(bufIdx, frameSize, max_buffer_size) != 0)
+    const int    read_rc   = dequeue_buffer(bufIdx, frameSize, max_buffer_size);
+    if (read_rc != camera_read_result::kOk)
     {
         *out_length = frameSize;
-        return -1;
+        return read_rc;
     }
     if (FrameDescArray[bufIdx].base == nullptr)
     {
@@ -651,39 +653,67 @@ int V4L2_Camera::camera_read_frame(size_t* out_length, size_t max_buffer_size)
         {
             std::cerr << "Failed to requeue buffer after null mapped buffer" << std::endl;
         }
-        return -1;
+        return camera_read_result::kFatal;
     }
 
-    // std::cout << "Dequeued buffer index: " << bufIdx << ", bytes used: " << frameSize <<
-    // std::endl; 如需拷贝，可使用 FrameDescArray[bufIdx].base 指向的映射地址。
     FrameDescArray[bufIdx].payloadSize = frameSize;
     *out_length                        = frameSize;
-
-    // if (requeue_buffer(&FrameDescArray[bufIdx]) != 0)
-    // {
-    //     std::cerr << "Failed to requeue buffer" << std::endl;
-    //     return -1;
-    // }
     CurrentFrameDesc = &FrameDescArray[bufIdx];  // 记录当前帧描述，供外部解码直接使用
-    return 0;
+    return camera_read_result::kOk;
 }
 
 int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
                                 const size_t maxBufferSize)
 {
     bufferSize = 0;
+
+    struct pollfd pfd{};
+    pfd.fd     = camera_fd;
+    pfd.events = POLLIN | POLLPRI;
+    const int poll_ret = poll(&pfd, 1, camera_params::kDequeueTimeoutMs);
+    if (poll_ret == 0)
+    {
+        std::cerr << "Dequeue timeout after " << camera_params::kDequeueTimeoutMs << " ms"
+                  << std::endl;
+        return camera_read_result::kTimeout;
+    }
+    if (poll_ret < 0)
+    {
+        if (errno == EINTR || errno == EAGAIN)
+        {
+            return camera_read_result::kRetryable;
+        }
+        std::cerr << "Failed to poll camera fd before dequeue: " << std::strerror(errno)
+                  << std::endl;
+        return camera_read_result::kFatal;
+    }
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+    {
+        std::cerr << "Poll reported camera fd abnormal revents=0x" << std::hex << pfd.revents
+                  << std::dec << std::endl;
+        return camera_read_result::kFatal;
+    }
+    if ((pfd.revents & (POLLIN | POLLPRI)) == 0)
+    {
+        return camera_read_result::kRetryable;
+    }
+
     struct v4l2_buffer buffer{};
     buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;      // 视频捕获类型
     buffer.memory = V4L2_MEMORY_MMAP;                 // 使用内存映射
     if (ioctl(camera_fd, VIDIOC_DQBUF, &buffer) < 0)  // 从内核队列中取出一帧数据
     {
+        if (errno == EINTR || errno == EAGAIN)
+        {
+            return camera_read_result::kRetryable;
+        }
         std::cerr << "Failed to dequeue buffer: " << std::strerror(errno) << std::endl;
-        return -1;
+        return camera_read_result::kFatal;
     }
     if (static_cast<int>(buffer.index) >= this->NumBuffers)
     {
         std::cerr << "Invalid buffer index dequeued: " << buffer.index << std::endl;
-        return -1;
+        return camera_read_result::kFatal;
     }
     bufferSize = buffer.bytesused;
     if (buffer.bytesused > maxBufferSize)
@@ -694,12 +724,11 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
         {
             std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
         }
-        return -1;
+        return camera_read_result::kFatal;
     }
-    // 回传数据
     BufIdx     = buffer.index;
     bufferSize = buffer.bytesused;
-    return 0;
+    return camera_read_result::kOk;
 }
 
 int V4L2_Camera::requeue_buffer(FrameDesc* frame_desc)
