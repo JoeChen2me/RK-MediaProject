@@ -21,7 +21,7 @@ class MppInstance
     int MppConfigWidthHeight(uint32_t width, uint32_t height);
     int MppDecode(size_t buffer_index, const void* mapped_base, size_t payload_size);
 
-    static constexpr size_t kMaxImportBuffers             = 10;
+    static constexpr size_t kMaxImportBuffers             = 15U;  // MPP 输入缓冲区的最大导入数量
     MppBuffer               MppBuffers[kMaxImportBuffers] = {nullptr};  // 存储导入的输入缓冲句柄
 
    private:

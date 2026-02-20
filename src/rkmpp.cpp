@@ -128,7 +128,7 @@ int MppInstance::MppAllocBuffer(const v4l2FD_Info* dma_fd_array, size_t dma_fd_c
     size_t       imported_count = 0;
     const size_t import_limit =
         (dma_fd_count < kMaxImportBuffers) ? dma_fd_count : kMaxImportBuffers;  // 避免越界访问
-    for (size_t i = 0; i < import_limit; ++i)
+    for (size_t i = 0; i < import_limit; ++i)                                   // 遍历
     {
         const v4l2FD_Info& fd_info = dma_fd_array[i];  // 引用传递，避免不必要的复制
         if (fd_info.fd < 0 || fd_info.bufferSize == 0)
@@ -137,9 +137,9 @@ int MppInstance::MppAllocBuffer(const v4l2FD_Info* dma_fd_array, size_t dma_fd_c
         }
 
         MppBufferInfo info{};
-        info.type  = MPP_BUFFER_TYPE_EXT_DMA;  // 指定导入的缓冲类型为 dma-buf
-        info.fd    = fd_info.fd;               // 直接使用传入的文件描述符
-        info.size  = fd_info.bufferSize;       // 使用传入的缓冲区大小
+        info.type  = MPP_BUFFER_TYPE_EXT_DMA;                  // 指定导入的缓冲类型为 dma-buf
+        info.fd    = fd_info.fd;                               // 直接使用传入的文件描述符
+        info.size  = static_cast<size_t>(fd_info.bufferSize);  // 使用传入的缓冲区大小
         info.index = static_cast<int>(i);
 
         ret = mpp_buffer_import(&MppBuffers[i],
@@ -164,7 +164,7 @@ int MppInstance::MppAllocBuffer(const v4l2FD_Info* dma_fd_array, size_t dma_fd_c
         ++imported_count;
     }
 
-    if (imported_count == 0)
+    if (imported_count == 0)  // 没有成功导入任何有效的 dma-buf fd，清理资源并返回错误
     {
         mpp_buffer_group_put(group);
         group = nullptr;
@@ -191,31 +191,77 @@ int MppInstance::MppConfigWidthHeight(uint32_t width, uint32_t height)
     return 0;
 }
 
-int MppInstance::MppDecode(const uint8_t* data, size_t len)
+int MppInstance::MppDecode(size_t buffer_index, const void* mapped_base, size_t payload_size)
 {
-    MPP_RET ret            = MPP_NOK;
-    size_t  effective_size = 0;
-    bool    taskFromOutput = false;
+    MPP_RET ret = MPP_NOK;
 
-    if (!mpp_ctx || !mpp_api || !group || !data || len == 0 || OutSize == 0)
+    if (!mpp_ctx || !mpp_api || !group || !mapped_base || payload_size == 0 || OutSize == 0)
+    {
+        return -1;
+    }
+    if (buffer_index >= kMaxImportBuffers)
+    {
+        std::cerr << "Invalid input buffer index for decode: " << buffer_index << std::endl;
+        return -1;
+    }
+
+    MppBuffer input_buffer = MppBuffers[buffer_index];  // 拷贝一个指针
+    if (!input_buffer)
+    {
+        std::cerr << "Input MppBuffer is null, index=" << buffer_index << std::endl;
+        return -1;
+    }
+
+    const auto*  input_data = static_cast<const uint8_t*>(mapped_base);  // 方便后续字节操作
+    const size_t effective_size =
+        FindJpegEffectiveSize(input_data, payload_size);  // 计算有效载荷大小，裁掉可能的对齐填充
+    if (effective_size == 0 || effective_size > mpp_buffer_get_size(input_buffer))
     {
         return -1;
     }
 
-    effective_size = FindJpegEffectiveSize(data, len);
-    if (effective_size == 0)
+    MppBuffer out_buf_local           = nullptr;
+    MppFrame  out_frm_local           = nullptr;
+    MppFrame  decoded_frame           = nullptr;
+    MppPacket packet_local            = nullptr;
+    MppTask   input_task              = nullptr;
+    MppTask   output_task             = nullptr;
+    bool      input_task_is_submitted = false;
+
+    auto release_task_packet = [&](MppTask task)
     {
-        return -1;
-    }
+        MppPacket packet_from_task = nullptr;
+        if (mpp_task_meta_get_packet(task, KEY_INPUT_PACKET, &packet_from_task) == MPP_OK &&
+            packet_from_task)
+        {
+            if (packet_from_task == packet_local)
+            {
+                packet_local = nullptr;
+            }
+            mpp_packet_deinit(&packet_from_task);
+        }
+    };
 
-    MppBuffer out_buf_local = nullptr;
-    MppBuffer pkt_buf_local = nullptr;
-    MppFrame  out_frm_local = nullptr;
-    MppPacket packet_local  = nullptr;
-    MppTask   task_local    = nullptr;
-    MppFrame  decoded_frame = nullptr;
+    auto release_local_resources = [&]()
+    {
+        if (out_frm_local)
+        {
+            mpp_frame_deinit(&out_frm_local);
+            out_frm_local = nullptr;
+        }
+        if (out_buf_local)
+        {
+            mpp_buffer_put(out_buf_local);
+            out_buf_local = nullptr;
+        }
+        if (packet_local)
+        {
+            mpp_packet_deinit(&packet_local);
+            packet_local = nullptr;
+        }
+    };
 
-    ret = mpp_buffer_get(group, &out_buf_local, OutSize);  // 从缓冲组获取一个输出缓冲
+    ret = mpp_buffer_get(group, &out_buf_local, OutSize);
     if (ret != MPP_OK || !out_buf_local)
     {
         goto fail;
@@ -227,34 +273,27 @@ int MppInstance::MppDecode(const uint8_t* data, size_t len)
         goto fail;
     }
 
-    // 对于 JPEG task 模式，主要由解码器写入输出 frame 信息，这里仅绑定用户输出缓冲。
     mpp_frame_set_width(out_frm_local, ImgWidth);
     mpp_frame_set_height(out_frm_local, ImgHeight);
     mpp_frame_set_hor_stride(out_frm_local, H_Stride);
     mpp_frame_set_ver_stride(out_frm_local, V_Stride);
     mpp_frame_set_fmt(out_frm_local, MPP_FMT_YUV420SP);
-
     mpp_frame_set_buffer(out_frm_local, out_buf_local);
 
-    ret = mpp_buffer_get(group, &pkt_buf_local, effective_size);  // 从缓冲组获取一个输入缓冲
-    if (ret != MPP_OK || !pkt_buf_local)
-    {
-        goto fail;
-    }
-
-    ret = mpp_buffer_write(pkt_buf_local, 0, const_cast<uint8_t*>(data), effective_size);
-    if (ret != MPP_OK)
-    {
-        goto fail;
-    }
-
-    ret = mpp_packet_init_with_buffer(&packet_local, pkt_buf_local);
+    ret = mpp_packet_init_with_buffer(
+        &packet_local,
+        input_buffer);  // 将 buffer_index 对应的 MppBuffer 包装成 MppPacket 以供解码输入
     if (ret != MPP_OK || !packet_local)
     {
         goto fail;
     }
-    mpp_packet_set_pos(packet_local, mpp_buffer_get_ptr(pkt_buf_local));
-    mpp_packet_set_length(packet_local, effective_size);
+    // 在用户态进行数据解析的必要操作
+    mpp_packet_set_data(packet_local,
+                        const_cast<void*>(mapped_base));  // 设置数据指针为映射后的基地址
+    mpp_packet_set_pos(packet_local,
+                       const_cast<void*>(mapped_base));   // 设置当前位置为映射后的基地址
+    mpp_packet_set_size(packet_local, effective_size);    // 设置数据大小为有效载荷大小
+    mpp_packet_set_length(packet_local, effective_size);  // 设置数据长度为有效载荷大小
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);
     if (ret < 0)
@@ -262,30 +301,31 @@ int MppInstance::MppDecode(const uint8_t* data, size_t len)
         goto fail;
     }
 
-    ret = mpp_api->dequeue(mpp_ctx, MPP_PORT_INPUT, &task_local);
-    if (ret != MPP_OK || !task_local)
+    ret = mpp_api->dequeue(mpp_ctx, MPP_PORT_INPUT, &input_task);
+    if (ret != MPP_OK || !input_task)
     {
         goto fail;
     }
 
-    ret = mpp_task_meta_set_packet(task_local, KEY_INPUT_PACKET, packet_local);
+    ret = mpp_task_meta_set_packet(input_task, KEY_INPUT_PACKET, packet_local);
     if (ret != MPP_OK)
     {
         goto fail;
     }
 
-    ret = mpp_task_meta_set_frame(task_local, KEY_OUTPUT_FRAME, out_frm_local);
+    ret = mpp_task_meta_set_frame(input_task, KEY_OUTPUT_FRAME, out_frm_local);
     if (ret != MPP_OK)
     {
         goto fail;
     }
 
-    ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_INPUT, task_local);
+    ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_INPUT, input_task);  // 提交解码任务
     if (ret != MPP_OK)
     {
         goto fail;
     }
-    task_local = nullptr;
+    input_task_is_submitted = true;
+    input_task              = nullptr;
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_OUTPUT, kPollTimeout500Ms);
     if (ret < 0)
@@ -293,14 +333,13 @@ int MppInstance::MppDecode(const uint8_t* data, size_t len)
         goto fail;
     }
 
-    ret = mpp_api->dequeue(mpp_ctx, MPP_PORT_OUTPUT, &task_local);
-    if (ret != MPP_OK || !task_local)
+    ret = mpp_api->dequeue(mpp_ctx, MPP_PORT_OUTPUT, &output_task);
+    if (ret != MPP_OK || !output_task)
     {
         goto fail;
     }
-    taskFromOutput = true;
 
-    ret = mpp_task_meta_get_frame(task_local, KEY_OUTPUT_FRAME, &decoded_frame);
+    ret = mpp_task_meta_get_frame(output_task, KEY_OUTPUT_FRAME, &decoded_frame);
     if (ret != MPP_OK || !decoded_frame)
     {
         goto fail;
@@ -319,67 +358,64 @@ int MppInstance::MppDecode(const uint8_t* data, size_t len)
     {
         goto fail;
     }
-    // 打印输出帧的信息
-    // std::cout << "Decoded frame info: width=" << mpp_frame_get_width(decoded_frame)
-    //           << ", height=" << mpp_frame_get_height(decoded_frame)
-    //           << ", hor_stride=" << mpp_frame_get_hor_stride(decoded_frame)
-    //           << ", ver_stride=" << mpp_frame_get_ver_stride(decoded_frame)
-    //           << ", fmt=" << mpp_frame_get_fmt(decoded_frame) << std::endl;
-    ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, task_local);
+
+    ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, output_task);  // 归还输出任务
     if (ret != MPP_OK)
     {
         goto fail;
     }
-    task_local = nullptr;
+    output_task = nullptr;
 
-    if (packet_local)
+    ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);
+    if (ret < 0)
     {
-        mpp_packet_deinit(&packet_local);
-        packet_local = nullptr;
+        goto fail;
     }
-    if (pkt_buf_local)
+
+    ret = mpp_api->dequeue(mpp_ctx, MPP_PORT_INPUT, &input_task);
+    if (ret != MPP_OK || !input_task)
     {
-        mpp_buffer_put(pkt_buf_local);
-        pkt_buf_local = nullptr;
+        goto fail;
     }
-    if (out_frm_local)
+
+    release_task_packet(input_task);
+
+    ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_INPUT, input_task);
+    if (ret != MPP_OK)
     {
-        mpp_frame_deinit(&out_frm_local);
-        out_frm_local = nullptr;
+        goto fail;
     }
-    if (out_buf_local)
-    {
-        mpp_buffer_put(out_buf_local);
-        out_buf_local = nullptr;
-    }
+    input_task_is_submitted = false;
+    input_task              = nullptr;
+
+    release_local_resources();
     return 0;
 
 fail:
-    if (task_local && mpp_ctx && mpp_api)
+    if (output_task)
     {
-        mpp_api->enqueue(mpp_ctx, taskFromOutput ? MPP_PORT_OUTPUT : MPP_PORT_INPUT, task_local);
-        task_local = nullptr;
+        (void)mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, output_task);
+        output_task = nullptr;
     }
-    if (packet_local)
+    if (input_task)
     {
-        mpp_packet_deinit(&packet_local);
-        packet_local = nullptr;
+        release_task_packet(input_task);
+        (void)mpp_api->enqueue(mpp_ctx, MPP_PORT_INPUT, input_task);
+        input_task = nullptr;
     }
-    if (pkt_buf_local)
+
+    if (input_task_is_submitted)
     {
-        mpp_buffer_put(pkt_buf_local);
-        pkt_buf_local = nullptr;
+        MppTask recycle_task = nullptr;
+        if (mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, MPP_POLL_NON_BLOCK) >= 0 &&
+            mpp_api->dequeue(mpp_ctx, MPP_PORT_INPUT, &recycle_task) == MPP_OK && recycle_task)
+        {
+            release_task_packet(recycle_task);
+            (void)mpp_api->enqueue(mpp_ctx, MPP_PORT_INPUT, recycle_task);
+        }
     }
-    if (out_frm_local)
-    {
-        mpp_frame_deinit(&out_frm_local);
-        out_frm_local = nullptr;
-    }
-    if (out_buf_local)
-    {
-        mpp_buffer_put(out_buf_local);
-        out_buf_local = nullptr;
-    }
+
+    release_local_resources();
 
     return -1;
 }

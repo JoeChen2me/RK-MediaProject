@@ -44,7 +44,7 @@ int main()
     }
     if (mpp_instance.MppAllocBuffer(camera.DMA_FD_Info, camera_params::kMaxMappedBuffers) != 0)
     {
-        std::cerr << "Failed to allocate MPP buffer group" << std::endl;
+        std::cerr << "Failed to import V4L2 dma-buf into MPP input buffers" << std::endl;
         return 1;
     }
     while (!should_exit)
@@ -56,11 +56,12 @@ int main()
             break;
         }
         // 获取到一帧数据后，调用 MPP 解码函数进行解码
-        if (mpp_instance.MppDecode(
-                static_cast<const uint8_t*>(camera.MapBuffers[camera.CurrentBufferIndex].base),
-                frame_length) != 0)
+        if (mpp_instance.MppDecode(camera.CurrentBufferIndex,
+                                   camera.MapBuffers[camera.CurrentBufferIndex].base,
+                                   frame_length) != 0)
         {
-            std::cerr << "Failed to decode the frame using MPP" << std::endl;
+            std::cerr << "Failed to decode the frame using MPP, index=" << camera.CurrentBufferIndex
+                      << ", length=" << frame_length << std::endl;
             if (camera.requeue_buffer(camera.CurrentBufferIndex) != 0)
             {
                 std::cerr << "Failed to requeue buffer after decode failure" << std::endl;
