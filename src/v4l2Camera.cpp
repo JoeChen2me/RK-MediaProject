@@ -525,18 +525,7 @@ int V4L2_Camera::deinit_camera_buffer()
     int ret = 0;
     for (int i = 0; i < this->NumBuffers; i++)
     {
-        // 关闭导出的 dma-buf 文件描述符
-        if (FrameDescArray[i].fd >= 0)
-        {
-            if (close(FrameDescArray[i].fd) != 0)
-            {
-                std::cerr << "Failed to close exported dma-buf fd for buffer " << i << ": "
-                          << std::strerror(errno) << std::endl;
-                ret = -1;
-            }
-            FrameDescArray[i].fd = -1;
-        }
-        // 解除内存映射
+        // 先解除用户态映射
         if (FrameDescArray[i].base != nullptr && FrameDescArray[i].Length > 0)
         {
             if (munmap(FrameDescArray[i].base, FrameDescArray[i].Length) != 0)
@@ -548,8 +537,20 @@ int V4L2_Camera::deinit_camera_buffer()
             FrameDescArray[i].base        = nullptr;
             FrameDescArray[i].Length      = 0;
             FrameDescArray[i].payloadSize = 0;
-            FrameDescArray[i].index       = -1;
         }
+
+        // 再关闭导出的 dma-buf 文件描述符
+        if (FrameDescArray[i].fd >= 0)
+        {
+            if (close(FrameDescArray[i].fd) != 0)
+            {
+                std::cerr << "Failed to close exported dma-buf fd for buffer " << i << ": "
+                          << std::strerror(errno) << std::endl;
+                ret = -1;
+            }
+            FrameDescArray[i].fd = -1;
+        }
+        FrameDescArray[i].index = -1;
     }
 
     struct v4l2_requestbuffers reqbuf{};
