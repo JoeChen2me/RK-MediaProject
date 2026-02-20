@@ -37,12 +37,12 @@ class V4L2_Camera
                           size_t  max_buffer_size = camera_params::kMaxFrameSize);  // 读取一帧数据
     int dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
                        const size_t maxBufferSize);  // 从内核中取出一个缓冲区进行读取
-    int requeue_buffer(unsigned int& BufIdx);        // 将一个缓冲区重新放回内核中以供后续使用
+    int requeue_buffer(FrameDesc* frame_desc);       // 将一个缓冲区重新放回内核中以供后续使用
 
-    int          set_exposure_time(int exposure_time_ms);
-    MappedBuffer MapBuffers[camera_params::kMaxMappedBuffers];   // 保存映射后的基地址和长度
-    v4l2FD_Info  DMA_FD_Info[camera_params::kMaxMappedBuffers];  // 保存每个缓冲区的文件描述符和大小
-    unsigned int CurrentBufferIndex = 0;                         // 当前使用的缓冲区索引
+    int       set_exposure_time(int exposure_time_ms);
+    FrameDesc FrameDescArray[camera_params::kMaxMappedBuffers];  // 保存每个缓冲区的统一描述信息
+    int       get_buffer_count() const { return NumBuffers; }
+    FrameDesc*   CurrentFrameDesc   = nullptr;  // 当前出队并等待处理的帧描述
 
    private:
     int close_camera();  // 仅供析构函数调用，外部不可见

@@ -42,7 +42,8 @@ int main()
         std::cerr << "Failed to configure MPP width and height" << std::endl;
         return 1;
     }
-    if (mpp_instance.MppAllocBuffer(camera.DMA_FD_Info, camera_params::kMaxMappedBuffers) != 0)
+    if (mpp_instance.MppAllocBuffer(camera.FrameDescArray,
+                                    static_cast<size_t>(camera.get_buffer_count())) != 0)
     {
         std::cerr << "Failed to import V4L2 dma-buf into MPP input buffers" << std::endl;
         return 1;
@@ -55,14 +56,24 @@ int main()
             std::cerr << "Failed to read a frame from the camera" << std::endl;
             break;
         }
-        // 获取到一帧数据后，调用 MPP 解码函数进行解码
-        if (mpp_instance.MppDecode(camera.CurrentBufferIndex,
-                                   camera.MapBuffers[camera.CurrentBufferIndex].base,
-                                   frame_length) != 0)
+        if (camera.CurrentFrameDesc == nullptr)
         {
-            std::cerr << "Failed to decode the frame using MPP, index=" << camera.CurrentBufferIndex
-                      << ", length=" << frame_length << std::endl;
-            if (camera.requeue_buffer(camera.CurrentBufferIndex) != 0)
+            std::cerr << "Current frame descriptor is null after frame capture" << std::endl;
+            break;
+        }
+        if (camera.CurrentFrameDesc->index < 0)
+        {
+            std::cerr << "Invalid current frame index: " << camera.CurrentFrameDesc->index
+                      << std::endl;
+            break;
+        }
+        // 获取到一帧数据后，调用 MPP 解码函数进行解码
+        if (mpp_instance.MppDecode(camera.CurrentFrameDesc) != 0)
+        {
+            std::cerr << "Failed to decode the frame using MPP, index="
+                      << camera.CurrentFrameDesc->index
+                      << ", payload=" << camera.CurrentFrameDesc->payloadSize << std::endl;
+            if (camera.requeue_buffer(camera.CurrentFrameDesc) != 0)
             {
                 std::cerr << "Failed to requeue buffer after decode failure" << std::endl;
                 break;
@@ -72,7 +83,7 @@ int main()
         std::cout << "Frame captured and decoded successfully, length: " << frame_length << " bytes"
                   << std::endl;
         // 处理完当前帧后，将缓冲区重新入队以供后续使用
-        if (camera.requeue_buffer(camera.CurrentBufferIndex) != 0)
+        if (camera.requeue_buffer(camera.CurrentFrameDesc) != 0)
         {
             std::cerr << "Failed to requeue buffer after processing frame" << std::endl;
             break;

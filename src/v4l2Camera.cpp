@@ -420,16 +420,15 @@ int V4L2_Camera::init_camera_buffer()
         return -1;
     }
 
-    NumBuffers = 0;
-    for (auto& mapped : MapBuffers)
+    NumBuffers       = 0;
+    CurrentFrameDesc = nullptr;
+    for (auto& frame_desc : FrameDescArray)
     {
-        mapped.base   = nullptr;
-        mapped.length = 0;
-    }
-    for (auto& fd_info : DMA_FD_Info)
-    {
-        fd_info.fd         = -1;
-        fd_info.bufferSize = 0;
+        frame_desc.index       = -1;
+        frame_desc.fd          = -1;
+        frame_desc.base        = nullptr;
+        frame_desc.Length      = 0;
+        frame_desc.payloadSize = 0;
     }
 
     // 请求缓冲区
@@ -489,10 +488,11 @@ int V4L2_Camera::init_camera_buffer()
             deinit_camera_buffer();
             return -1;
         }
-        DMA_FD_Info[i].fd         = expbuf.fd;      // 保存导出的文件描述符
-        DMA_FD_Info[i].bufferSize = buffer.length;  // 保存缓冲区大小
-        MapBuffers[i].base        = buffer_start;   // 保存映射后的基地址
-        MapBuffers[i].length      = buffer.length;  // 保存缓冲区长度
+        FrameDescArray[i].index  = static_cast<int>(i);  // 保存缓冲区索引
+        FrameDescArray[i].fd     = expbuf.fd;            // 保存导出的文件描述符
+        FrameDescArray[i].base   = buffer_start;         // 保存映射后的基地址
+        FrameDescArray[i].Length = buffer.length;        // 保存缓冲区长度
+
         this->NumBuffers++;
     }
 
@@ -526,28 +526,29 @@ int V4L2_Camera::deinit_camera_buffer()
     for (int i = 0; i < this->NumBuffers; i++)
     {
         // 关闭导出的 dma-buf 文件描述符
-        if (DMA_FD_Info[i].fd >= 0)
+        if (FrameDescArray[i].fd >= 0)
         {
-            if (close(DMA_FD_Info[i].fd) != 0)
+            if (close(FrameDescArray[i].fd) != 0)
             {
                 std::cerr << "Failed to close exported dma-buf fd for buffer " << i << ": "
                           << std::strerror(errno) << std::endl;
                 ret = -1;
             }
-            DMA_FD_Info[i].fd         = -1;
-            DMA_FD_Info[i].bufferSize = 0;
+            FrameDescArray[i].fd = -1;
         }
         // 解除内存映射
-        if (MapBuffers[i].base != nullptr && MapBuffers[i].length > 0)
+        if (FrameDescArray[i].base != nullptr && FrameDescArray[i].Length > 0)
         {
-            if (munmap(MapBuffers[i].base, MapBuffers[i].length) != 0)
+            if (munmap(FrameDescArray[i].base, FrameDescArray[i].Length) != 0)
             {
                 std::cerr << "Failed to munmap buffer " << i << ": " << std::strerror(errno)
                           << std::endl;
                 ret = -1;
             }
-            MapBuffers[i].base   = nullptr;
-            MapBuffers[i].length = 0;
+            FrameDescArray[i].base        = nullptr;
+            FrameDescArray[i].Length      = 0;
+            FrameDescArray[i].payloadSize = 0;
+            FrameDescArray[i].index       = -1;
         }
     }
 
@@ -561,7 +562,8 @@ int V4L2_Camera::deinit_camera_buffer()
         ret = -1;
     }
 
-    NumBuffers = 0;
+    NumBuffers       = 0;
+    CurrentFrameDesc = nullptr;
     return ret;
 }
 
@@ -632,6 +634,8 @@ int V4L2_Camera::camera_read_frame(size_t* out_length, size_t max_buffer_size)
         std::cerr << "Invalid output buffer arguments" << std::endl;
         return -1;
     }
+    CurrentFrameDesc = nullptr;
+
     unsigned int bufIdx    = 0;
     unsigned int frameSize = 0;
     if (dequeue_buffer(bufIdx, frameSize, max_buffer_size) != 0)
@@ -639,10 +643,10 @@ int V4L2_Camera::camera_read_frame(size_t* out_length, size_t max_buffer_size)
         *out_length = frameSize;
         return -1;
     }
-    if (MapBuffers[bufIdx].base == nullptr)
+    if (FrameDescArray[bufIdx].base == nullptr)
     {
         std::cerr << "Mapped buffer base is null for index: " << bufIdx << std::endl;
-        if (requeue_buffer(bufIdx) != 0)
+        if (requeue_buffer(&FrameDescArray[bufIdx]) != 0)
         {
             std::cerr << "Failed to requeue buffer after null mapped buffer" << std::endl;
         }
@@ -650,16 +654,16 @@ int V4L2_Camera::camera_read_frame(size_t* out_length, size_t max_buffer_size)
     }
 
     // std::cout << "Dequeued buffer index: " << bufIdx << ", bytes used: " << frameSize <<
-    // std::endl; 将取出的帧数据复制到用户提供的输出缓冲区中
-    // std::memcpy(out_buffer, MapBuffers[bufIdx].base, frameSize);
-    *out_length = frameSize;
+    // std::endl; 如需拷贝，可使用 FrameDescArray[bufIdx].base 指向的映射地址。
+    FrameDescArray[bufIdx].payloadSize = frameSize;
+    *out_length                        = frameSize;
 
-    // if (requeue_buffer(bufIdx) != 0)
+    // if (requeue_buffer(&FrameDescArray[bufIdx]) != 0)
     // {
     //     std::cerr << "Failed to requeue buffer" << std::endl;
     //     return -1;
     // }
-    CurrentBufferIndex = bufIdx;  // 记录当前使用的缓冲区索引，等待用户处理完后再入队
+    CurrentFrameDesc = &FrameDescArray[bufIdx];  // 记录当前帧描述，供外部解码直接使用
     return 0;
 }
 
@@ -697,10 +701,24 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
     return 0;
 }
 
-int V4L2_Camera::requeue_buffer(unsigned int& BufIdx)
+int V4L2_Camera::requeue_buffer(FrameDesc* frame_desc)
 {
+    if (frame_desc == nullptr)
+    {
+        std::cerr << "Invalid frame descriptor for requeue: null pointer" << std::endl;
+        return -1;
+    }
+
+    const int idx = frame_desc->index;
+    if (idx < 0 || idx >= NumBuffers)
+    {
+        std::cerr << "Invalid buffer index for requeue: " << idx << std::endl;
+        return -1;
+    }
+    const auto buf_idx = static_cast<unsigned int>(idx);
+
     struct v4l2_buffer buffer{};
-    buffer.index  = BufIdx;
+    buffer.index  = buf_idx;
     buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;     // 视频捕获类型
     buffer.memory = V4L2_MEMORY_MMAP;                // 使用内存映射
     if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
@@ -708,6 +726,14 @@ int V4L2_Camera::requeue_buffer(unsigned int& BufIdx)
         std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
         return -1;
     }
+
+    frame_desc->payloadSize             = 0;
+    FrameDescArray[buf_idx].payloadSize = 0;
+    if (CurrentFrameDesc == frame_desc || CurrentFrameDesc == &FrameDescArray[buf_idx])
+    {
+        CurrentFrameDesc = nullptr;
+    }
+
     return 0;
 }
 

@@ -17,9 +17,9 @@ class MppInstance
     ~MppInstance();
 
     int MppInit();
-    int MppAllocBuffer(const v4l2FD_Info* dma_fd_array, size_t buffer_count);
+    int MppAllocBuffer(const FrameDesc* frame_desc_array, size_t buffer_count);
     int MppConfigWidthHeight(uint32_t width, uint32_t height);
-    int MppDecode(size_t buffer_index, const void* mapped_base, size_t payload_size);
+    int MppDecode(const FrameDesc* frame_desc);
 
     static constexpr size_t kMaxImportBuffers             = 15U;  // MPP 输入缓冲区的最大导入数量
     MppBuffer               MppBuffers[kMaxImportBuffers] = {nullptr};  // 存储导入的输入缓冲句柄

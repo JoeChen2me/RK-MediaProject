@@ -101,13 +101,13 @@ fail:
     return -1;
 }
 
-int MppInstance::MppAllocBuffer(const v4l2FD_Info* dma_fd_array, size_t dma_fd_count)
+int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_desc_count)
 {
     if (!mpp_ctx || !mpp_api)
     {
         return -1;
     }
-    if (!dma_fd_array || dma_fd_count == 0)
+    if (!frame_desc_array || frame_desc_count == 0)
     {
         return -1;
     }
@@ -123,41 +123,65 @@ int MppInstance::MppAllocBuffer(const v4l2FD_Info* dma_fd_array, size_t dma_fd_c
         return -1;
     }
 
-    // 维持 V4L2 index 和 MPP index 一一对应：
-    // 第 i 个 V4L2 fd 固定导入到 MppBuffers[i]，不做压缩重排。
-    size_t       imported_count = 0;
-    const size_t import_limit =
-        (dma_fd_count < kMaxImportBuffers) ? dma_fd_count : kMaxImportBuffers;  // 避免越界访问
-    for (size_t i = 0; i < import_limit; ++i)                                   // 遍历
+    auto cleanup_import_resources = [&]()
     {
-        const v4l2FD_Info& fd_info = dma_fd_array[i];  // 引用传递，避免不必要的复制
-        if (fd_info.fd < 0 || fd_info.bufferSize == 0)
+        for (auto& buffer : MppBuffers)
+        {
+            if (buffer)
+            {
+                mpp_buffer_put(buffer);
+                buffer = nullptr;
+            }
+        }
+        if (group)
+        {
+            mpp_buffer_group_put(group);
+            group = nullptr;
+        }
+    };
+
+    // 维持 V4L2 index 和 MPP index 一一对应：
+    // 每个 FrameDesc 按 index 导入到对应的 MppBuffers[slot]。
+    size_t       imported_count = 0;
+    const size_t import_limit   = (frame_desc_count < kMaxImportBuffers)
+                                      ? frame_desc_count
+                                      : kMaxImportBuffers;  // 避免越界访问
+    for (size_t i = 0; i < import_limit; ++i)               // 遍历
+    {
+        const FrameDesc& frame_desc = frame_desc_array[i];  // 引用当前帧描述，避免不必要的拷贝
+        if (frame_desc.fd < 0 || frame_desc.Length == 0)
         {
             continue;  // 跳过无效的 fd 信息
         }
 
-        MppBufferInfo info{};
-        info.type  = MPP_BUFFER_TYPE_EXT_DMA;                  // 指定导入的缓冲类型为 dma-buf
-        info.fd    = fd_info.fd;                               // 直接使用传入的文件描述符
-        info.size  = static_cast<size_t>(fd_info.bufferSize);  // 使用传入的缓冲区大小
-        info.index = static_cast<int>(i);
-
-        ret = mpp_buffer_import(&MppBuffers[i],
-                                &info);  // 将 dma-buf fd 导入到 MPP 缓冲句柄中
-        if (ret != MPP_OK || !MppBuffers[i])
+        const int slot = frame_desc.index;
+        if (slot < 0 || static_cast<size_t>(slot) >= kMaxImportBuffers)
         {
-            std::cerr << "Failed to import dma-buf fd to MPP, index=" << i << ", fd=" << fd_info.fd
-                      << std::endl;
-            for (size_t j = 0; j < import_limit; ++j)
-            {
-                if (MppBuffers[j])
-                {
-                    mpp_buffer_put(MppBuffers[j]);
-                    MppBuffers[j] = nullptr;
-                }
-            }
-            mpp_buffer_group_put(group);
-            group = nullptr;
+            std::cerr << "Invalid frame index for MPP import, index=" << slot
+                      << ", fd=" << frame_desc.fd << std::endl;
+            cleanup_import_resources();
+            return -1;
+        }
+        if (MppBuffers[slot])  // 同一 slot 已经有缓冲导入，说明 index 重复了，属于错误情况
+        {
+            std::cerr << "Duplicate frame index for MPP import, index=" << slot
+                      << ", fd=" << frame_desc.fd << std::endl;
+            cleanup_import_resources();
+            return -1;
+        }
+
+        MppBufferInfo info{};
+        info.type  = MPP_BUFFER_TYPE_EXT_DMA;  // 指定导入的缓冲类型为 dma-buf
+        info.fd    = frame_desc.fd;
+        info.size  = frame_desc.Length;
+        info.index = slot;
+
+        ret = mpp_buffer_import(&MppBuffers[slot], &info);  // 将 dma-buf fd 导入到 MPP 缓冲句柄中
+        if (ret != MPP_OK || !MppBuffers[slot])
+        {
+            std::cerr << "Failed to import dma-buf fd to MPP, index=" << slot
+                      << ", fd=" << frame_desc.fd << std::endl;
+            cleanup_import_resources();
             return -1;
         }
 
@@ -166,8 +190,7 @@ int MppInstance::MppAllocBuffer(const v4l2FD_Info* dma_fd_array, size_t dma_fd_c
 
     if (imported_count == 0)  // 没有成功导入任何有效的 dma-buf fd，清理资源并返回错误
     {
-        mpp_buffer_group_put(group);
-        group = nullptr;
+        cleanup_import_resources();
         std::cerr << "No valid dma-buf fd to import into MPP" << std::endl;
         return -1;
     }
@@ -191,17 +214,32 @@ int MppInstance::MppConfigWidthHeight(uint32_t width, uint32_t height)
     return 0;
 }
 
-int MppInstance::MppDecode(size_t buffer_index, const void* mapped_base, size_t payload_size)
+int MppInstance::MppDecode(const FrameDesc* frame_desc)
 {
     MPP_RET ret = MPP_NOK;
+
+    if (!frame_desc)
+    {
+        return -1;
+    }
+
+    const int    buffer_index = frame_desc->index;
+    const void*  mapped_base  = frame_desc->base;
+    const size_t payload_size = frame_desc->payloadSize;
 
     if (!mpp_ctx || !mpp_api || !group || !mapped_base || payload_size == 0 || OutSize == 0)
     {
         return -1;
     }
-    if (buffer_index >= kMaxImportBuffers)
+    if (buffer_index < 0 || static_cast<size_t>(buffer_index) >= kMaxImportBuffers)
     {
         std::cerr << "Invalid input buffer index for decode: " << buffer_index << std::endl;
+        return -1;
+    }
+    if (frame_desc->Length > 0 && payload_size > frame_desc->Length)
+    {
+        std::cerr << "Invalid payload size for decode, payload=" << payload_size
+                  << ", capacity=" << frame_desc->Length << std::endl;
         return -1;
     }
 
