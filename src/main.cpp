@@ -42,7 +42,7 @@ int main()
         std::cerr << "Failed to configure MPP width and height" << std::endl;
         return 1;
     }
-    if (mpp_instance.MppAllocBuffer() != 0)
+    if (mpp_instance.MppAllocBuffer(camera.DMA_FD_Info, camera_params::kMaxMappedBuffers) != 0)
     {
         std::cerr << "Failed to allocate MPP buffer group" << std::endl;
         return 1;

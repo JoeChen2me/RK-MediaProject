@@ -3,6 +3,8 @@
 
 #include <linux/videodev2.h>
 
+#include "pubDataType.h"
+
 #include <cstddef>
 #include <string>
 
@@ -15,12 +17,6 @@ inline constexpr size_t kMaxFrameSize       = 1024 * 1024;
 inline constexpr __u32  kRequestBufferCount = 4;
 inline constexpr size_t kMaxMappedBuffers   = 10;
 }  // namespace camera_params
-
-struct MappedBuffer
-{
-    void*  base   = nullptr;
-    size_t length = 0;
-};
 
 class V4L2_Camera
 {
@@ -44,8 +40,9 @@ class V4L2_Camera
     int requeue_buffer(unsigned int& BufIdx);        // 将一个缓冲区重新放回内核中以供后续使用
 
     int          set_exposure_time(int exposure_time_ms);
-    MappedBuffer MapBuffers[camera_params::kMaxMappedBuffers];  // 保存映射后的基地址和长度
-    unsigned int CurrentBufferIndex = 0;                        // 当前使用的缓冲区索引
+    MappedBuffer MapBuffers[camera_params::kMaxMappedBuffers];   // 保存映射后的基地址和长度
+    v4l2FD_Info  DMA_FD_Info[camera_params::kMaxMappedBuffers];  // 保存每个缓冲区的文件描述符和大小
+    unsigned int CurrentBufferIndex = 0;                         // 当前使用的缓冲区索引
 
    private:
     int close_camera();  // 仅供析构函数调用，外部不可见

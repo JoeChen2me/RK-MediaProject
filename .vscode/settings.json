@@ -1,7 +1,7 @@
 {
   "C_Cpp.debugShortcut": false,
   "cmake.buildBeforeRun": true,
-  "editor.wordWrapColumn": 300,
+  "editor.wordWrapColumn": 400,
   "editor.wordWrap": "wordWrapColumn",
   "editor.formatOnSave": true,
   "[cpp]": {

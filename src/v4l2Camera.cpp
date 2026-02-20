@@ -426,6 +426,11 @@ int V4L2_Camera::init_camera_buffer()
         mapped.base   = nullptr;
         mapped.length = 0;
     }
+    for (auto& fd_info : DMA_FD_Info)
+    {
+        fd_info.fd         = -1;
+        fd_info.bufferSize = 0;
+    }
 
     // 请求缓冲区
     struct v4l2_requestbuffers reqbuf{};
@@ -473,9 +478,21 @@ int V4L2_Camera::init_camera_buffer()
             deinit_camera_buffer();
             return -1;
         }
-
-        MapBuffers[i].base   = buffer_start;
-        MapBuffers[i].length = buffer.length;
+        struct v4l2_exportbuffer expbuf{};
+        expbuf.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;        // 视频捕获类型
+        expbuf.index = i;                                  // 指定要导出的缓冲区索引
+        if (ioctl(camera_fd, VIDIOC_EXPBUF, &expbuf) < 0)  // 导出缓冲区以获取文件描述符
+        {
+            std::cerr << "Failed to export buffer " << i << ": " << std::strerror(errno)
+                      << std::endl;
+            munmap(buffer_start, buffer.length);
+            deinit_camera_buffer();
+            return -1;
+        }
+        DMA_FD_Info[i].fd         = expbuf.fd;      // 保存导出的文件描述符
+        DMA_FD_Info[i].bufferSize = buffer.length;  // 保存缓冲区大小
+        MapBuffers[i].base        = buffer_start;   // 保存映射后的基地址
+        MapBuffers[i].length      = buffer.length;  // 保存缓冲区长度
         this->NumBuffers++;
     }
 
@@ -491,6 +508,7 @@ int V4L2_Camera::init_camera_buffer()
         {
             std::cerr << "Failed to queue buffer " << buffer.index << ": " << std::strerror(errno)
                       << std::endl;
+            deinit_camera_buffer();
             return -1;
         }
     }
@@ -507,6 +525,19 @@ int V4L2_Camera::deinit_camera_buffer()
     int ret = 0;
     for (int i = 0; i < this->NumBuffers; i++)
     {
+        // 关闭导出的 dma-buf 文件描述符
+        if (DMA_FD_Info[i].fd >= 0)
+        {
+            if (close(DMA_FD_Info[i].fd) != 0)
+            {
+                std::cerr << "Failed to close exported dma-buf fd for buffer " << i << ": "
+                          << std::strerror(errno) << std::endl;
+                ret = -1;
+            }
+            DMA_FD_Info[i].fd         = -1;
+            DMA_FD_Info[i].bufferSize = 0;
+        }
+        // 解除内存映射
         if (MapBuffers[i].base != nullptr && MapBuffers[i].length > 0)
         {
             if (munmap(MapBuffers[i].base, MapBuffers[i].length) != 0)
@@ -519,6 +550,17 @@ int V4L2_Camera::deinit_camera_buffer()
             MapBuffers[i].length = 0;
         }
     }
+
+    struct v4l2_requestbuffers reqbuf{};
+    reqbuf.count  = 0;  // 释放驱动侧分配的全部缓冲区
+    reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    reqbuf.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(camera_fd, VIDIOC_REQBUFS, &reqbuf) < 0)
+    {
+        std::cerr << "Failed to release V4L2 buffers: " << std::strerror(errno) << std::endl;
+        ret = -1;
+    }
+
     NumBuffers = 0;
     return ret;
 }

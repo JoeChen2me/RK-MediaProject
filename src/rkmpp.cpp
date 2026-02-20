@@ -101,9 +101,13 @@ fail:
     return -1;
 }
 
-int MppInstance::MppAllocBuffer()
+int MppInstance::MppAllocBuffer(const v4l2FD_Info* dma_fd_array, size_t dma_fd_count)
 {
     if (!mpp_ctx || !mpp_api)
+    {
+        return -1;
+    }
+    if (!dma_fd_array || dma_fd_count == 0)
     {
         return -1;
     }
@@ -112,10 +116,59 @@ int MppInstance::MppAllocBuffer()
         return 0;
     }
 
-    const MPP_RET ret = mpp_buffer_group_get_internal(&group, MPP_BUFFER_TYPE_ION);
+    MPP_RET ret = mpp_buffer_group_get_internal(&group, MPP_BUFFER_TYPE_ION);
     if (ret != MPP_OK || !group)
     {
         group = nullptr;
+        return -1;
+    }
+
+    // 维持 V4L2 index 和 MPP index 一一对应：
+    // 第 i 个 V4L2 fd 固定导入到 MppBuffers[i]，不做压缩重排。
+    size_t       imported_count = 0;
+    const size_t import_limit =
+        (dma_fd_count < kMaxImportBuffers) ? dma_fd_count : kMaxImportBuffers;  // 避免越界访问
+    for (size_t i = 0; i < import_limit; ++i)
+    {
+        const v4l2FD_Info& fd_info = dma_fd_array[i];  // 引用传递，避免不必要的复制
+        if (fd_info.fd < 0 || fd_info.bufferSize == 0)
+        {
+            continue;  // 跳过无效的 fd 信息
+        }
+
+        MppBufferInfo info{};
+        info.type  = MPP_BUFFER_TYPE_EXT_DMA;  // 指定导入的缓冲类型为 dma-buf
+        info.fd    = fd_info.fd;               // 直接使用传入的文件描述符
+        info.size  = fd_info.bufferSize;       // 使用传入的缓冲区大小
+        info.index = static_cast<int>(i);
+
+        ret = mpp_buffer_import(&MppBuffers[i],
+                                &info);  // 将 dma-buf fd 导入到 MPP 缓冲句柄中
+        if (ret != MPP_OK || !MppBuffers[i])
+        {
+            std::cerr << "Failed to import dma-buf fd to MPP, index=" << i << ", fd=" << fd_info.fd
+                      << std::endl;
+            for (size_t j = 0; j < import_limit; ++j)
+            {
+                if (MppBuffers[j])
+                {
+                    mpp_buffer_put(MppBuffers[j]);
+                    MppBuffers[j] = nullptr;
+                }
+            }
+            mpp_buffer_group_put(group);
+            group = nullptr;
+            return -1;
+        }
+
+        ++imported_count;
+    }
+
+    if (imported_count == 0)
+    {
+        mpp_buffer_group_put(group);
+        group = nullptr;
+        std::cerr << "No valid dma-buf fd to import into MPP" << std::endl;
         return -1;
     }
     return 0;
@@ -267,11 +320,11 @@ int MppInstance::MppDecode(const uint8_t* data, size_t len)
         goto fail;
     }
     // 打印输出帧的信息
-    std::cout << "Decoded frame info: width=" << mpp_frame_get_width(decoded_frame)
-              << ", height=" << mpp_frame_get_height(decoded_frame)
-              << ", hor_stride=" << mpp_frame_get_hor_stride(decoded_frame)
-              << ", ver_stride=" << mpp_frame_get_ver_stride(decoded_frame)
-              << ", fmt=" << mpp_frame_get_fmt(decoded_frame) << std::endl;
+    // std::cout << "Decoded frame info: width=" << mpp_frame_get_width(decoded_frame)
+    //           << ", height=" << mpp_frame_get_height(decoded_frame)
+    //           << ", hor_stride=" << mpp_frame_get_hor_stride(decoded_frame)
+    //           << ", ver_stride=" << mpp_frame_get_ver_stride(decoded_frame)
+    //           << ", fmt=" << mpp_frame_get_fmt(decoded_frame) << std::endl;
     ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, task_local);
     if (ret != MPP_OK)
     {
@@ -333,6 +386,15 @@ fail:
 
 MppInstance::~MppInstance()
 {
+    for (auto& buffer : MppBuffers)
+    {
+        if (buffer)
+        {
+            mpp_buffer_put(buffer);
+            buffer = nullptr;
+        }
+    }
+
     if (group)
     {
         mpp_buffer_group_put(group);
