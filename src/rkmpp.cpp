@@ -1,7 +1,5 @@
 #include "rkmpp.h"
-
 #include <iostream>
-
 namespace
 {
 constexpr MppPollType kPollTimeout500Ms = static_cast<MppPollType>(500);
@@ -274,7 +272,6 @@ int MppInstance::MppDecode(const uint8_t* data, size_t len)
               << ", hor_stride=" << mpp_frame_get_hor_stride(decoded_frame)
               << ", ver_stride=" << mpp_frame_get_ver_stride(decoded_frame)
               << ", fmt=" << mpp_frame_get_fmt(decoded_frame) << std::endl;
-
     ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, task_local);
     if (ret != MPP_OK)
     {
@@ -302,7 +299,6 @@ int MppInstance::MppDecode(const uint8_t* data, size_t len)
         mpp_buffer_put(out_buf_local);
         out_buf_local = nullptr;
     }
-
     return 0;
 
 fail:

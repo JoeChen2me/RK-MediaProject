@@ -61,7 +61,12 @@ int main()
                 frame_length) != 0)
         {
             std::cerr << "Failed to decode the frame using MPP" << std::endl;
-            break;
+            if (camera.requeue_buffer(camera.CurrentBufferIndex) != 0)
+            {
+                std::cerr << "Failed to requeue buffer after decode failure" << std::endl;
+                break;
+            }
+            continue;
         }
         std::cout << "Frame captured and decoded successfully, length: " << frame_length << " bytes"
                   << std::endl;
