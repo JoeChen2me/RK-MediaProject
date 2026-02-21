@@ -27,7 +27,7 @@ int main()
     std::signal(SIGINT, signal_handler);
 
     V4L2_Camera camera;
-    if (camera.camera_GlobalInit(device, 100) != 0)  // 全局初始化，设置曝光时间为 0（自动）
+    if (camera.camera_GlobalInit(device, 0) != 0)  // 全局初始化，设置曝光时间为 0（自动）
     {
         std::cerr << "Failed to initialize camera globally" << std::endl;
         return 1;

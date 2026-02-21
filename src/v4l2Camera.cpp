@@ -340,19 +340,96 @@ int V4L2_Camera::set_exposure_time(int exposure_time_ms)
         return -1;
     }
 
-    if (exposure_time_ms == 0)
+    if (exposure_time_ms == 0)  // 自动曝光模式
     {
-        v4l2_control auto_ctrl{};
-        auto_ctrl.id    = V4L2_CID_EXPOSURE_AUTO;
-        auto_ctrl.value = V4L2_EXPOSURE_AUTO;
-        if (ioctl(camera_fd, VIDIOC_S_CTRL, &auto_ctrl) < 0)
+        v4l2_queryctrl query{};
+        query.id = V4L2_CID_EXPOSURE_AUTO;
+        if (ioctl(camera_fd, VIDIOC_QUERYCTRL, &query) < 0)
         {
-            std::cerr << "Failed to set auto exposure mode: " << std::strerror(errno) << std::endl;
+            std::cerr << "Failed to query auto exposure control: " << std::strerror(errno)
+                      << std::endl;
             return -1;
         }
 
-        std::cout << "Exposure mode set to auto" << std::endl;
-        return 0;
+        if (query.flags & V4L2_CTRL_FLAG_DISABLED)
+        {
+            std::cerr << "Auto exposure control is disabled by driver" << std::endl;
+            return -1;
+        }
+
+        auto mode_supported = [&](int mode) -> bool
+        {
+            if (mode < query.minimum || mode > query.maximum)
+            {
+                return false;
+            }
+            if (query.type == V4L2_CTRL_TYPE_MENU || query.type == V4L2_CTRL_TYPE_INTEGER_MENU)
+            {
+                v4l2_querymenu menu{};
+                menu.id    = V4L2_CID_EXPOSURE_AUTO;
+                menu.index = static_cast<__u32>(mode);
+                if (ioctl(camera_fd, VIDIOC_QUERYMENU, &menu) < 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        auto mode_name = [](int mode) -> const char*
+        {
+            switch (mode)
+            {
+                case V4L2_EXPOSURE_AUTO:
+                    return "Auto Mode";
+                case V4L2_EXPOSURE_MANUAL:
+                    return "Manual Mode";
+                case V4L2_EXPOSURE_SHUTTER_PRIORITY:
+                    return "Shutter Priority Mode";
+                case V4L2_EXPOSURE_APERTURE_PRIORITY:
+                    return "Aperture Priority Mode";
+                default:
+                    return "Unknown Mode";
+            }
+        };
+
+        // 有些 UVC 摄像头不支持 V4L2_EXPOSURE_AUTO(0)，只支持 Aperture Priority(3)。
+        // 这里按“真正自动优先，其次光圈优先”尝试，避免 EINVAL。
+        const int auto_mode_candidates[] = {
+            V4L2_EXPOSURE_AUTO,
+            V4L2_EXPOSURE_APERTURE_PRIORITY,
+            V4L2_EXPOSURE_SHUTTER_PRIORITY,
+        };
+
+        int last_errno = 0;
+        for (int mode : auto_mode_candidates)
+        {
+            if (!mode_supported(mode))
+            {
+                continue;
+            }
+
+            v4l2_control auto_ctrl{};
+            auto_ctrl.id    = V4L2_CID_EXPOSURE_AUTO;
+            auto_ctrl.value = mode;
+            if (ioctl(camera_fd, VIDIOC_S_CTRL, &auto_ctrl) == 0)
+            {
+                std::cout << "Exposure mode set to " << mode_name(mode) << std::endl;
+                return 0;
+            }
+            last_errno = errno;
+        }
+
+        if (last_errno != 0)
+        {
+            std::cerr << "Failed to set auto exposure mode: " << std::strerror(last_errno)
+                      << std::endl;
+        }
+        else
+        {
+            std::cerr << "No supported auto exposure mode is available on this camera" << std::endl;
+        }
+        return -1;
     }
 
     // Most UVC drivers use V4L2_CID_EXPOSURE_ABSOLUTE in 100us units.
@@ -668,8 +745,8 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
     bufferSize = 0;
 
     struct pollfd pfd{};
-    pfd.fd     = camera_fd;
-    pfd.events = POLLIN | POLLPRI;
+    pfd.fd             = camera_fd;
+    pfd.events         = POLLIN | POLLPRI;
     const int poll_ret = poll(&pfd, 1, camera_params::kDequeueTimeoutMs);
     if (poll_ret == 0)
     {
