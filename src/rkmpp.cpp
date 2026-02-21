@@ -115,8 +115,11 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
     {
         return 0;
     }
-
-    MPP_RET ret = mpp_buffer_group_get_internal(&group, MPP_BUFFER_TYPE_ION);
+    /**
+     * 根据文档手册，模式一只需要声明mpp_buffer_group_get_internal 而后直接使用 get 来获取缓冲即可
+     * 使用完归还的时候直接 put 即可。
+     */
+    MPP_RET ret = mpp_buffer_group_get_internal(&group, MPP_BUFFER_TYPE_ION);  // 内部缓冲分配
     if (ret != MPP_OK || !group)
     {
         group = nullptr;
@@ -299,7 +302,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         }
     };
 
-    ret = mpp_buffer_get(group, &out_buf_local, OutSize);
+    ret = mpp_buffer_get(group, &out_buf_local, OutSize);  // 从缓存池申请指定大小的内存块
     if (ret != MPP_OK || !out_buf_local)
     {
         goto fail;

@@ -744,17 +744,18 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
 {
     bufferSize = 0;
 
+    // 使用 poll 来实现非阻塞等待，避免直接调用 DQBUF 可能导致的长时间阻塞
     struct pollfd pfd{};
     pfd.fd             = camera_fd;
-    pfd.events         = POLLIN | POLLPRI;
+    pfd.events         = POLLIN | POLLPRI;  // 等待可读事件
     const int poll_ret = poll(&pfd, 1, camera_params::kDequeueTimeoutMs);
-    if (poll_ret == 0)
+    if (poll_ret == 0)  // 超时没有事件发生，安全地返回超时结果，避免长时间阻塞在 DQBUF 上
     {
         std::cerr << "Dequeue timeout after " << camera_params::kDequeueTimeoutMs << " ms"
                   << std::endl;
         return camera_read_result::kTimeout;
     }
-    if (poll_ret < 0)
+    if (poll_ret < 0)  // poll 出错，可能是中断或其他错误，根据 errno 判断是否重试
     {
         if (errno == EINTR || errno == EAGAIN)
         {
@@ -764,17 +765,22 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
                   << std::endl;
         return camera_read_result::kFatal;
     }
-    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+    if (pfd.revents & (POLLERR | POLLHUP |
+                       POLLNVAL))  // 监测异常事件，避免在异常状态下调用 DQBUF 导致更严重的问题
     {
         std::cerr << "Poll reported camera fd abnormal revents=0x" << std::hex << pfd.revents
                   << std::dec << std::endl;
         return camera_read_result::kFatal;
     }
-    if ((pfd.revents & (POLLIN | POLLPRI)) == 0)
+    if ((pfd.revents & (POLLIN | POLLPRI)) ==
+        0)  // 没有可读事件，可能是误报或其他事件，安全起见不调用 DQBUF
     {
         return camera_read_result::kRetryable;
     }
-
+    /**
+     * 在确认有可读事件后，安全地调用 DQBUF 来获取帧数据。即使在极少数情况下 poll 可能误报，但 DQBUF
+     * 的错误处理也足够健壮，可以通过 errno 判断是否需要重试或处理错误。
+     */
     struct v4l2_buffer buffer{};
     buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;      // 视频捕获类型
     buffer.memory = V4L2_MEMORY_MMAP;                 // 使用内存映射
