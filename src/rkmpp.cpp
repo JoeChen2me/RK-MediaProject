@@ -1,6 +1,7 @@
 #include "rkmpp.h"
 #include <fcntl.h>  // open, O_RDWR, O_CLOEXEC
 #include <linux/dma-heap.h>
+#include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <unistd.h>  // close
 
@@ -34,9 +35,11 @@ size_t FindJpegEffectiveSize(const uint8_t* data, size_t len)
 
 MppInstance::MppInstance()
 {
-    for (auto& fd : MppOutputFDArray)
+    for (auto& fd_info : MppOutputFDList)
     {
-        fd = -1;
+        fd_info.fd   = -1;
+        fd_info.base = nullptr;
+        fd_info.size = 0;
     }
 }
 
@@ -545,7 +548,7 @@ MppInstance::~MppInstance()
     }
 }
 
-int MppInstance::AllocDmaBufFD(size_t size)
+int MppInstance::AllocDmaBufFD(MppOutputFD& output, size_t size)
 {
     if (size == 0)
     {
@@ -571,21 +574,45 @@ int MppInstance::AllocDmaBufFD(size_t size)
     }
 
     close(heap);
-    return req.fd;  // 成功返回 DMABUF fd
+    heap = -1;
+
+    void* mapped_base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, req.fd, 0);
+    if (mapped_base == MAP_FAILED)
+    {
+        std::cerr << "Failed to mmap output dma-buf fd=" << req.fd << ": " << std::strerror(errno)
+                  << std::endl;
+        close(req.fd);
+        return -1;
+    }
+
+    output.fd   = req.fd;
+    output.base = mapped_base;
+    output.size = size;
+    return 0;
 }
 
 void MppInstance::ReleaseExternalOutputBuffers()
 {
-    for (auto& fd : MppOutputFDArray)
+    for (auto& output : MppOutputFDList)
     {
-        if (fd >= 0)
+        if (output.base && output.size > 0)
         {
-            if (close(fd) != 0)
+            if (munmap(output.base, output.size) != 0)
             {
-                std::cerr << "Failed to close output dma-buf fd=" << fd << ": "
+                std::cerr << "Failed to munmap output dma-buf fd=" << output.fd << ": "
                           << std::strerror(errno) << std::endl;
             }
-            fd = -1;
+            output.base = nullptr;
+            output.size = 0;
+        }
+        if (output.fd >= 0)
+        {
+            if (close(output.fd) != 0)
+            {
+                std::cerr << "Failed to close output dma-buf fd=" << output.fd << ": "
+                          << std::strerror(errno) << std::endl;
+            }
+            output.fd = -1;
         }
     }
 }
@@ -611,24 +638,23 @@ int MppInstance::CommitExternalOutputBuffers(size_t size)
 
     for (size_t i = 0; i < kMaxBufferCount; ++i)
     {
-        int fd = AllocDmaBufFD(size);
-        if (fd < 0)
+        MppOutputFD& output = MppOutputFDList[i];
+        if (AllocDmaBufFD(output, size) != 0)
         {
             (void)mpp_buffer_group_clear(group);
             ReleaseExternalOutputBuffers();
             return -1;
         }
 
-        MppOutputFDArray[i] = fd;
-        commit.fd           = fd;  // 提交外部 dma-buf fd 给 MPP 在 group 生命周期内使用
+        commit.fd = output.fd;  // 提交外部 dma-buf fd 给 MPP 在 group 生命周期内使用
         commit.ptr =
             nullptr;  // MPP_BUFFER_TYPE_EXT_DMA 模式下 ptr 不需要设置，确保为 nullptr 以免误用
         commit.index = static_cast<int>(i);                // 用于跟踪
         ret          = mpp_buffer_commit(group, &commit);  // 提交缓冲到组
         if (ret != MPP_OK)
         {
-            std::cerr << "Failed to commit external output buffer, index=" << i << ", fd=" << fd
-                      << std::endl;
+            std::cerr << "Failed to commit external output buffer, index=" << i
+                      << ", fd=" << output.fd << std::endl;
             (void)mpp_buffer_group_clear(group);
             ReleaseExternalOutputBuffers();
             return -1;

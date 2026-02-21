@@ -12,4 +12,11 @@ struct FrameDesc
     size_t payloadSize = 0;        // 当前帧有效载荷大小（字节）
 };
 
+struct MppOutputFD
+{
+    int    fd   = -1;       // MPP 输出缓冲的 dma-buf fd
+    void*  base = nullptr;  // 可选的 mmap 基地址，便于调试或特殊处理
+    size_t size = 0;        // 缓冲区大小（字节）
+};
+
 #endif  // PUBDATATYPE_H
