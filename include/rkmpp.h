@@ -31,14 +31,19 @@ class MppInstance
     MppBuffer MppBuffers[kMaxImportBuffers] = {nullptr};  // 存储导入的输入缓冲句柄
 
    private:
-    MppCtx         mpp_ctx   = nullptr;  // 复用的 MPP 解码上下文
-    MppApi*        mpp_api   = nullptr;  // 复用的 MPP API 入口
-    MppBufferGroup group     = nullptr;  // task 模式下用于申请输出帧缓存
-    uint32_t       ImgWidth  = 0;        // 输入图像宽
-    uint32_t       ImgHeight = 0;        // 输入图像高
-    uint32_t       H_Stride  = 0;        // 行对齐
-    uint32_t       V_Stride  = 0;        // 列对齐
-    size_t         OutSize   = 0;        // 单帧输出缓冲大小
+    int  AllocDmaBufFD(size_t size);                   // 分配一个 dma-buf fd
+    int  CommitExternalOutputBuffers(size_t size);     // 按指定大小提交外部输出缓冲到 group
+    void ReleaseExternalOutputBuffers();               // 释放外部输出缓冲 fd
+
+    MppCtx         mpp_ctx                = nullptr;  // 复用的 MPP 解码上下文
+    MppApi*        mpp_api                = nullptr;  // 复用的 MPP API 入口
+    MppBufferGroup group                  = nullptr;  // task 模式下用于申请输出帧缓存
+    uint32_t       ImgWidth               = 0;        // 输入图像宽
+    uint32_t       ImgHeight              = 0;        // 输入图像高
+    uint32_t       H_Stride               = 0;        // 行对齐
+    uint32_t       V_Stride               = 0;        // 列对齐
+    size_t         OutSize                = 0;        // 单帧输出缓冲大小
+    int MppOutputFDArray[kMaxBufferCount] = {};  // 存储输出缓冲的 dma-buf fd，便于后续导出或调试
 };
 
 #endif  // RKMPP_H

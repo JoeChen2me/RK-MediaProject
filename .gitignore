@@ -5,3 +5,4 @@ app
 .env
 node_modules/
 dist/
+experiments/

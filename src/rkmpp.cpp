@@ -1,5 +1,13 @@
 #include "rkmpp.h"
+#include <fcntl.h>  // open, O_RDWR, O_CLOEXEC
+#include <linux/dma-heap.h>
+#include <sys/ioctl.h>
+#include <unistd.h>  // close
+
+#include <cerrno>
+#include <cstring>
 #include <iostream>
+
 namespace
 {
 constexpr MppPollType kPollTimeout500Ms = static_cast<MppPollType>(500);
@@ -24,7 +32,13 @@ size_t FindJpegEffectiveSize(const uint8_t* data, size_t len)
 }
 }  // namespace
 
-MppInstance::MppInstance() = default;
+MppInstance::MppInstance()
+{
+    for (auto& fd : MppOutputFDArray)
+    {
+        fd = -1;
+    }
+}
 
 int MppInstance::MppInit()
 {
@@ -89,6 +103,8 @@ fail:
     }
     if (group)
     {
+        (void)mpp_buffer_group_clear(group);
+        ReleaseExternalOutputBuffers();
         mpp_buffer_group_put(group);
         group = nullptr;
     }
@@ -117,14 +133,22 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
     }
     // 这个函数需要在MppConfigWidthHeight之后进行调用
 
-    MPP_RET ret = mpp_buffer_group_get_internal(&group, MPP_BUFFER_TYPE_ION);  // 内部缓冲分配
+    MPP_RET ret =
+        mpp_buffer_group_get_external(&group, MPP_BUFFER_TYPE_EXT_DMA);  // 模式三：外部缓冲组
     if (ret != MPP_OK || !group)
     {
         group = nullptr;
         return -1;
     }
-    ret = mpp_buffer_group_limit_config(group, OutSize, kMaxBufferCount);  // 设置缓冲大小和数量限制
+    ret = mpp_buffer_group_limit_config(group, OutSize,
+                                        kMaxBufferCount);  // 配置上限，实际缓冲通过 commit 注入
     if (ret != MPP_OK)
+    {
+        mpp_buffer_group_put(group);
+        group = nullptr;
+        return -1;
+    }
+    if (CommitExternalOutputBuffers(OutSize) != 0)  // 先按先验尺寸申请并提交外部输出缓冲
     {
         mpp_buffer_group_put(group);
         group = nullptr;
@@ -133,6 +157,8 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
     ret = mpp_api->control(mpp_ctx, MPP_DEC_SET_EXT_BUF_GROUP, group);  // 将缓冲组关联到解码上下文
     if (ret != MPP_OK)
     {
+        (void)mpp_buffer_group_clear(group);
+        ReleaseExternalOutputBuffers();
         mpp_buffer_group_put(group);
         group = nullptr;
         return -1;
@@ -149,6 +175,8 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
         }
         if (group)
         {
+            (void)mpp_buffer_group_clear(group);
+            ReleaseExternalOutputBuffers();
             mpp_buffer_group_put(group);
             group = nullptr;
         }
@@ -398,14 +426,18 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
 
     if (mpp_frame_get_info_change(decoded_frame))
     {
-        // 对于模式二，需要处理图像信息变化
+        // 模式三：info change 后重建外部输出缓冲池并重新绑定到解码器
         size_t buf_size = mpp_frame_get_buf_size(decoded_frame);
         OutSize =
             (OutSize > buf_size)
                 ? OutSize
                 : buf_size;  // 更新输出缓冲大小，取当前值和解码器要求的最大值，避免过小导致后续解码失败
-        ret = mpp_buffer_group_limit_config(group, OutSize, kMaxBufferCount);  // 更新缓冲大小限制
+        ret = mpp_buffer_group_limit_config(group, OutSize, kMaxBufferCount);  // 更新缓冲上限配置
         if (ret != MPP_OK)
+        {
+            goto fail;
+        }
+        if (CommitExternalOutputBuffers(OutSize) != 0)
         {
             goto fail;
         }
@@ -500,6 +532,8 @@ MppInstance::~MppInstance()
 
     if (group)
     {
+        (void)mpp_buffer_group_clear(group);
+        ReleaseExternalOutputBuffers();
         mpp_buffer_group_put(group);
         group = nullptr;
     }
@@ -509,4 +543,97 @@ MppInstance::~MppInstance()
         mpp_ctx = nullptr;
         mpp_api = nullptr;
     }
+}
+
+int MppInstance::AllocDmaBufFD(size_t size)
+{
+    if (size == 0)
+    {
+        std::cerr << "Invalid size for DMA buffer allocation: " << size << std::endl;
+        return -1;
+    }
+    int heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+    if (heap < 0)
+    {
+        perror("Failed to open dma_heap");
+        return -1;
+    }
+
+    dma_heap_allocation_data req{};
+    req.len      = size;
+    req.fd_flags = O_RDWR | O_CLOEXEC;
+
+    if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &req) < 0)
+    {
+        perror("DMA heap allocation failed");
+        close(heap);
+        return -1;
+    }
+
+    close(heap);
+    return req.fd;  // 成功返回 DMABUF fd
+}
+
+void MppInstance::ReleaseExternalOutputBuffers()
+{
+    for (auto& fd : MppOutputFDArray)
+    {
+        if (fd >= 0)
+        {
+            if (close(fd) != 0)
+            {
+                std::cerr << "Failed to close output dma-buf fd=" << fd << ": "
+                          << std::strerror(errno) << std::endl;
+            }
+            fd = -1;
+        }
+    }
+}
+
+int MppInstance::CommitExternalOutputBuffers(size_t size)
+{
+    if (!group || size == 0)
+    {
+        return -1;
+    }
+
+    // 先清理组里旧的可复用缓冲，再释放本地记录的 fd。
+    MPP_RET ret = mpp_buffer_group_clear(group);
+    if (ret != MPP_OK)
+    {
+        return -1;
+    }
+    ReleaseExternalOutputBuffers();
+
+    MppBufferInfo commit{};
+    commit.type = MPP_BUFFER_TYPE_EXT_DMA;
+    commit.size = size;
+
+    for (size_t i = 0; i < kMaxBufferCount; ++i)
+    {
+        int fd = AllocDmaBufFD(size);
+        if (fd < 0)
+        {
+            (void)mpp_buffer_group_clear(group);
+            ReleaseExternalOutputBuffers();
+            return -1;
+        }
+
+        MppOutputFDArray[i] = fd;
+        commit.fd           = fd;  // 提交外部 dma-buf fd 给 MPP 在 group 生命周期内使用
+        commit.ptr =
+            nullptr;  // MPP_BUFFER_TYPE_EXT_DMA 模式下 ptr 不需要设置，确保为 nullptr 以免误用
+        commit.index = static_cast<int>(i);                // 用于跟踪
+        ret          = mpp_buffer_commit(group, &commit);  // 提交缓冲到组
+        if (ret != MPP_OK)
+        {
+            std::cerr << "Failed to commit external output buffer, index=" << i << ", fd=" << fd
+                      << std::endl;
+            (void)mpp_buffer_group_clear(group);
+            ReleaseExternalOutputBuffers();
+            return -1;
+        }
+    }
+
+    return 0;
 }
