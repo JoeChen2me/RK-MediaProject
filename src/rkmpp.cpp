@@ -115,17 +115,28 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
     {
         return 0;
     }
-    /**
-     * 根据文档手册，模式一只需要声明mpp_buffer_group_get_internal 而后直接使用 get 来获取缓冲即可
-     * 使用完归还的时候直接 put 即可。
-     */
+    // 这个函数需要在MppConfigWidthHeight之后进行调用
+
     MPP_RET ret = mpp_buffer_group_get_internal(&group, MPP_BUFFER_TYPE_ION);  // 内部缓冲分配
     if (ret != MPP_OK || !group)
     {
         group = nullptr;
         return -1;
     }
-
+    ret = mpp_buffer_group_limit_config(group, OutSize, kMaxBufferCount);  // 设置缓冲大小和数量限制
+    if (ret != MPP_OK)
+    {
+        mpp_buffer_group_put(group);
+        group = nullptr;
+        return -1;
+    }
+    ret = mpp_api->control(mpp_ctx, MPP_DEC_SET_EXT_BUF_GROUP, group);  // 将缓冲组关联到解码上下文
+    if (ret != MPP_OK)
+    {
+        mpp_buffer_group_put(group);
+        group = nullptr;
+        return -1;
+    }
     auto cleanup_import_resources = [&]()
     {
         for (auto& buffer : MppBuffers)
@@ -387,6 +398,22 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
 
     if (mpp_frame_get_info_change(decoded_frame))
     {
+        // 对于模式二，需要处理图像信息变化
+        size_t buf_size = mpp_frame_get_buf_size(decoded_frame);
+        OutSize =
+            (OutSize > buf_size)
+                ? OutSize
+                : buf_size;  // 更新输出缓冲大小，取当前值和解码器要求的最大值，避免过小导致后续解码失败
+        ret = mpp_buffer_group_limit_config(group, OutSize, kMaxBufferCount);  // 更新缓冲大小限制
+        if (ret != MPP_OK)
+        {
+            goto fail;
+        }
+        ret = mpp_api->control(mpp_ctx, MPP_DEC_SET_EXT_BUF_GROUP, group);  // 重新关联缓冲组
+        if (ret != MPP_OK)
+        {
+            goto fail;
+        }
         ret = mpp_api->control(mpp_ctx, MPP_DEC_SET_INFO_CHANGE_READY, nullptr);
         if (ret != MPP_OK)
         {

@@ -10,6 +10,13 @@
 #include "pubDataType.h"  //导入公共数据类型头文件
 #include <cstddef>
 
+namespace
+{
+constexpr size_t kMaxBufferCount   = 15U;  // MPP 输出缓冲区的数量
+constexpr size_t kMaxImportBuffers = 15U;  // MPP 输入缓冲区的最大导入数量
+
+};  // namespace
+
 class MppInstance
 {
    public:
@@ -21,8 +28,7 @@ class MppInstance
     int MppConfigWidthHeight(uint32_t width, uint32_t height);
     int MppDecode(const FrameDesc* frame_desc);
 
-    static constexpr size_t kMaxImportBuffers             = 15U;  // MPP 输入缓冲区的最大导入数量
-    MppBuffer               MppBuffers[kMaxImportBuffers] = {nullptr};  // 存储导入的输入缓冲句柄
+    MppBuffer MppBuffers[kMaxImportBuffers] = {nullptr};  // 存储导入的输入缓冲句柄
 
    private:
     MppCtx         mpp_ctx   = nullptr;  // 复用的 MPP 解码上下文
