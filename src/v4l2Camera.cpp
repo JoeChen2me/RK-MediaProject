@@ -151,6 +151,7 @@ int V4L2_Camera::check_cameraCapabilities()
     isMJPEGSupport            = false;
     isTargetResolutionSupport = false;
     isTargetFpsSupport        = false;
+    ActiveConfig              = {};
 
     if (ioctl(camera_fd, VIDIOC_QUERYCAP, &cap) < 0)
     {
@@ -265,13 +266,48 @@ int V4L2_Camera::check_cameraCapabilities()
         std::cerr << "Failed to set pixel format: " << std::strerror(errno) << std::endl;
         return -1;
     }
-    // 检查返回值是否符合预期
-    if (v4l2fmt.fmt.pix.width != camera_params::kCaptureWidth ||
-        v4l2fmt.fmt.pix.height != camera_params::kCaptureHeight ||
-        v4l2fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG)
+    // 二次确认：S_FMT 后立即 G_FMT，读取驱动最终生效配置。
     {
-        std::cerr << "Camera did not accept the requested format" << std::endl;
+        struct v4l2_format fmt_get{};
+        fmt_get.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(camera_fd, VIDIOC_G_FMT, &fmt_get) < 0)
+        {
+            std::cerr << "Failed to get pixel format after VIDIOC_S_FMT: " << std::strerror(errno)
+                      << std::endl;
+            return -1;
+        }
+        auto fourcc_to_str = [](__u32 f)
+        {
+            char s[5] = {static_cast<char>(f & 0xFF), static_cast<char>((f >> 8) & 0xFF),
+                         static_cast<char>((f >> 16) & 0xFF), static_cast<char>((f >> 24) & 0xFF),
+                         '\0'};
+            return std::string(s);
+        };
+        ActiveConfig.width       = fmt_get.fmt.pix.width;
+        ActiveConfig.height      = fmt_get.fmt.pix.height;
+        ActiveConfig.pixelformat = fmt_get.fmt.pix.pixelformat;
+        ActiveConfig.bytesperline = fmt_get.fmt.pix.bytesperline;
+        ActiveConfig.sizeimage    = fmt_get.fmt.pix.sizeimage;
+        std::cout << "[V4L2] Active format:"
+                  << " width=" << ActiveConfig.width
+                  << " height=" << ActiveConfig.height
+                  << " pixfmt=" << fourcc_to_str(ActiveConfig.pixelformat)
+                  << " bytesperline=" << ActiveConfig.bytesperline
+                  << " sizeimage=" << ActiveConfig.sizeimage << std::endl;
+    }
+    // 必须保持 MJPEG，宽高允许驱动协商后调整（后续按 ActiveConfig 传递）。
+    if (ActiveConfig.pixelformat != V4L2_PIX_FMT_MJPEG)
+    {
+        std::cerr << "Camera did not keep MJPEG format, active pixelformat=0x" << std::hex
+                  << ActiveConfig.pixelformat << std::dec << std::endl;
         return -1;
+    }
+    if (ActiveConfig.width != camera_params::kCaptureWidth ||
+        ActiveConfig.height != camera_params::kCaptureHeight)
+    {
+        std::cerr << "Warning: active resolution is " << ActiveConfig.width << "x"
+                  << ActiveConfig.height << ", requested " << camera_params::kCaptureWidth << "x"
+                  << camera_params::kCaptureHeight << std::endl;
     }
     // 确认是否支持设置帧率
     std::memset(&streamparm, 0, sizeof(streamparm));
@@ -296,21 +332,43 @@ int V4L2_Camera::check_cameraCapabilities()
         std::cerr << "Failed to set frame rate: " << std::strerror(errno) << std::endl;
         return -1;
     }
-    // 检查设置结果 想做“二次确认”或兼容某些实现不规范的驱动，再额外 G_PARM
-    // 一次也可以，但不是必需的
-    if (streamparm.parm.capture.timeperframe.numerator == 0)
+    // 二次确认：S_PARM 后立即 G_PARM，读取驱动最终生效帧率。
+    {
+        struct v4l2_streamparm parm_get{};
+        parm_get.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(camera_fd, VIDIOC_G_PARM, &parm_get) < 0)
+        {
+            std::cerr << "Failed to get stream parameters after VIDIOC_S_PARM: "
+                      << std::strerror(errno) << std::endl;
+            return -1;
+        }
+        double fps_verify = 0.0;
+        if (parm_get.parm.capture.timeperframe.numerator != 0)
+        {
+            fps_verify =
+                static_cast<double>(parm_get.parm.capture.timeperframe.denominator) /
+                parm_get.parm.capture.timeperframe.numerator;
+        }
+        ActiveConfig.fps_num = parm_get.parm.capture.timeperframe.numerator;
+        ActiveConfig.fps_den = parm_get.parm.capture.timeperframe.denominator;
+        std::cout << "[V4L2] Active frame rate:"
+                  << " tpf=" << ActiveConfig.fps_num << "/" << ActiveConfig.fps_den
+                  << " fps=" << fps_verify << std::endl;
+    }
+    // 基于 G_PARM 的读回结果进行告警判断，避免使用 S_PARM 请求值造成误判。
+    if (ActiveConfig.fps_num == 0)
     {
         std::cerr << "Invalid frame rate returned by driver" << std::endl;
         return -1;
     }
-    double fpsActual = static_cast<double>(streamparm.parm.capture.timeperframe.denominator) /
-                       streamparm.parm.capture.timeperframe.numerator;
+    double fpsActual =
+        static_cast<double>(ActiveConfig.fps_den) / static_cast<double>(ActiveConfig.fps_num);
     if (std::abs(fpsActual - static_cast<double>(camera_params::kCaptureFps)) > 0.1)
     {
-        std::cerr << "Camera did not accept the requested frame rate"
-                  << " (actual: " << fpsActual << " fps)" << std::endl;
-        return -1;
+        std::cerr << "Warning: active frame rate is " << fpsActual
+                  << " fps, requested " << camera_params::kCaptureFps << " fps" << std::endl;
     }
+    ActiveConfig.valid = true;
     std::cout << "Camera capabilities check passed.\nCamera Init Done " << std::endl;
     return 0;
 }

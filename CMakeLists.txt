@@ -13,6 +13,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_executable(app
     src/main.cpp
     src/rkmpp.cpp
+    src/rkrga.cpp
     src/v4l2Camera.cpp
     # Examples: add more source files here
     # src/utils/log.cpp
@@ -32,6 +33,17 @@ target_include_directories(app PRIVATE
 find_package(Threads REQUIRED)
 
 # 显式查找 Rockchip MPP / RGA 动态库，便于后续接入解码与图像处理链路
+find_path(RGA_INCLUDE_DIR
+    NAMES im2d.h
+    PATHS /usr/include/rga
+    NO_DEFAULT_PATH
+)
+if (NOT RGA_INCLUDE_DIR)
+    message(FATAL_ERROR "Failed to find RGA headers (im2d.h) in /usr/include/rga")
+endif()
+
+target_include_directories(app PRIVATE ${RGA_INCLUDE_DIR})
+
 find_library(ROCKCHIP_MPP_LIB NAMES rockchip_mpp REQUIRED)
 find_library(RGA_LIB NAMES rga REQUIRED)
 

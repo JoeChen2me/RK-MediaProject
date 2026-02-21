@@ -41,6 +41,7 @@ MppInstance::MppInstance()
         fd_info.base = nullptr;
         fd_info.size = 0;
     }
+    OutBufFD2Index_Map.clear();  // 初始化映射表
 }
 
 int MppInstance::MppInit()
@@ -261,7 +262,9 @@ int MppInstance::MppConfigWidthHeight(uint32_t width, uint32_t height)
 
 int MppInstance::MppDecode(const FrameDesc* frame_desc)
 {
-    MPP_RET ret = MPP_NOK;
+    MPP_RET ret               = MPP_NOK;
+    int     outbuf_fd         = -1;
+    size_t  MappedBufferIndex = -1;
 
     if (!frame_desc)
     {
@@ -461,6 +464,29 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         goto fail;
     }
 
+    outbuf_fd = mpp_buffer_get_fd(mpp_frame_get_buffer(decoded_frame));
+    if (outbuf_fd < 0)
+    {
+        goto fail;
+    }
+    {
+        const auto out_it = OutBufFD2Index_Map.find(outbuf_fd);
+        if (out_it == OutBufFD2Index_Map.end())
+        {
+            std::cerr << "Output fd is not in committed external buffer map, fd=" << outbuf_fd
+                      << std::endl;
+            goto fail;
+        }
+        MappedBufferIndex = out_it->second;  // 查找输出 fd 对应的 MPP 缓冲索引
+    }
+    // TODO 等待后续手动实现后续内容。
+
+    /**
+     *
+     * 到这里说明成功实现了解码，接下来便是收尾工作
+     *
+     */
+
     ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, output_task);  // 归还输出任务
     if (ret != MPP_OK)
     {
@@ -468,6 +494,10 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     }
     output_task = nullptr;
 
+    /**
+     * 输出任务归还后继续轮询输入端，确保输入任务被正确回收并释放相关资源，避免内存泄漏或资源占用过高的情况
+     * 直接只做一次提交的话，会出现存在未被回收的 packet 资源
+     */
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);
     if (ret < 0)
     {
@@ -615,6 +645,7 @@ void MppInstance::ReleaseExternalOutputBuffers()
             output.fd = -1;
         }
     }
+    OutBufFD2Index_Map.clear();  // 清空 fd 到输出缓冲索引的映射
 }
 
 int MppInstance::CommitExternalOutputBuffers(size_t size)
@@ -645,7 +676,8 @@ int MppInstance::CommitExternalOutputBuffers(size_t size)
             ReleaseExternalOutputBuffers();
             return -1;
         }
-
+        OutBufFD2Index_Map[output.fd] =
+            i;                  // 记录成功提交的输出缓冲 fd 与索引映射，便于后续按 fd 反查索引
         commit.fd = output.fd;  // 提交外部 dma-buf fd 给 MPP 在 group 生命周期内使用
         commit.ptr =
             nullptr;  // MPP_BUFFER_TYPE_EXT_DMA 模式下 ptr 不需要设置，确保为 nullptr 以免误用

@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "rkmpp.h"
+#include "rkrga.h"
 #include "v4l2Camera.h"
 
 const std::string            device      = "/dev/video0";
@@ -32,6 +33,12 @@ int main()
         std::cerr << "Failed to initialize camera globally" << std::endl;
         return 1;
     }
+    const VideoCaptureConfig& active_cfg = camera.get_active_config();
+    if (!active_cfg.valid)
+    {
+        std::cerr << "Camera active config is invalid after initialization" << std::endl;
+        return 1;
+    }
 
     MppInstance mpp_instance;
     if (mpp_instance.MppInit() != 0)  // 初始化 MPP 实例
@@ -39,8 +46,7 @@ int main()
         std::cerr << "Failed to initialize MPP instance" << std::endl;
         return 1;
     }
-    if (mpp_instance.MppConfigWidthHeight(camera_params::kCaptureWidth,
-                                          camera_params::kCaptureHeight) !=
+    if (mpp_instance.MppConfigWidthHeight(active_cfg.width, active_cfg.height) !=
         0)  // 配置 MPP 的宽高参数
     {
         std::cerr << "Failed to configure MPP width and height" << std::endl;
@@ -50,6 +56,28 @@ int main()
                                     static_cast<size_t>(camera.get_buffer_count())) != 0)
     {
         std::cerr << "Failed to import V4L2 dma-buf into MPP input buffers" << std::endl;
+        return 1;
+    }
+
+    RgaInstance rga_instance;
+    if (rga_instance.RgaInit() != 0)
+    {
+        std::cerr << "Failed to initialize RGA instance" << std::endl;
+        return 1;
+    }
+    auto align16 = [](uint32_t value) { return (value + 15u) & ~15u; };
+    const uint32_t cap_w      = active_cfg.width;
+    const uint32_t cap_h      = active_cfg.height;
+    const uint32_t cap_hs     = align16(cap_w);
+    const uint32_t cap_vs     = align16(cap_h);
+    if (rga_instance.SetInputImageConfig(cap_w, cap_h, cap_hs, cap_vs) != 0)
+    {
+        std::cerr << "Failed to configure RGA input image params" << std::endl;
+        return 1;
+    }
+    if (rga_instance.SetOutputImageConfig(cap_w, cap_h, cap_hs, cap_vs) != 0)
+    {
+        std::cerr << "Failed to configure RGA output image params" << std::endl;
         return 1;
     }
 

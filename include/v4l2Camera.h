@@ -51,7 +51,8 @@ class V4L2_Camera
     int       set_exposure_time(int exposure_time_ms);
     FrameDesc FrameDescArray[camera_params::kMaxMappedBuffers];  // 保存每个缓冲区的统一描述信息
     int       get_buffer_count() const { return NumBuffers; }
-    FrameDesc*   CurrentFrameDesc   = nullptr;  // 当前出队并等待处理的帧描述
+    const VideoCaptureConfig& get_active_config() const { return ActiveConfig; }
+    FrameDesc*                CurrentFrameDesc = nullptr;  // 当前出队并等待处理的帧描述
 
    private:
     int close_camera();  // 仅供析构函数调用，外部不可见
@@ -69,6 +70,7 @@ class V4L2_Camera
     bool                    isTargetResolutionSupport = false;
     bool                    isTargetFpsSupport        = false;
     int                     NumBuffers                = 0;  // 实际请求到的缓冲区数量
+    VideoCaptureConfig      ActiveConfig{};
 };
 
 struct v4l2CapList

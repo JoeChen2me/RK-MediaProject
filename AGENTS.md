@@ -16,6 +16,9 @@
    - 路径：`/home/joe/Documents/DevelopDoc/OrangePi5Plus-用户手册-md 格式.md`
    - 用途：板级硬件、系统配置与外设使用参考。
 
+3. `Rockchip_Developer_Guide_RGA_CN.md`
+   - 路径：`/home/joe/Documents/DevelopDoc/Rockchip_Developer_Guide_RGA_CN.md`
+   - 用途：RGA 图像处理接口、缩放/色彩转换与性能优化参考。
 
 ## Rockchip 官方示例代码位置
 
