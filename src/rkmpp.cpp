@@ -330,7 +330,6 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
                         const_cast<void*>(mapped_base));  // 设置数据指针为映射后的基地址
     mpp_packet_set_pos(packet_local,
                        const_cast<void*>(mapped_base));   // 设置当前位置为映射后的基地址
-    mpp_packet_set_size(packet_local, effective_size);    // 设置数据大小为有效载荷大小
     mpp_packet_set_length(packet_local, effective_size);  // 设置数据长度为有效载荷大小
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);

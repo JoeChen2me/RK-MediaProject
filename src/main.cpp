@@ -27,7 +27,7 @@ int main()
     std::signal(SIGINT, signal_handler);
 
     V4L2_Camera camera;
-    if (camera.camera_GlobalInit(device, 480) != 0)  // 全局初始化，设置曝光时间为 480ms
+    if (camera.camera_GlobalInit(device, 100) != 0)  // 全局初始化，设置曝光时间为 0（自动）
     {
         std::cerr << "Failed to initialize camera globally" << std::endl;
         return 1;
@@ -112,9 +112,9 @@ int main()
                     break;
                 }
 
-                size_t frame_length      = camera_params::kMaxFrameSize;
-                int    frame_capture_ret = camera.camera_read_frame(&frame_length,
-                                                                  camera_params::kMaxFrameSize);
+                size_t frame_length = camera_params::kMaxFrameSize;
+                int    frame_capture_ret =
+                    camera.camera_read_frame(&frame_length, camera_params::kMaxFrameSize);
                 if (frame_capture_ret == camera_read_result::kRetryable)
                 {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -123,8 +123,8 @@ int main()
                 if (frame_capture_ret == camera_read_result::kTimeout)
                 {
                     std::cerr << "Camera dequeue timeout reached ("
-                              << camera_params::kDequeueTimeoutMs
-                              << " ms), stop capture thread" << std::endl;
+                              << camera_params::kDequeueTimeoutMs << " ms), stop capture thread"
+                              << std::endl;
                     fatal_error.store(true);
                     request_stop();
                     break;
@@ -222,7 +222,6 @@ int main()
                     recycleQueue.push_back(frame_desc);
                 }
             }
-
         });
 
     while (!stop_requested.load())
