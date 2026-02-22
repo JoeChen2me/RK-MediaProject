@@ -6,12 +6,15 @@
 #include <unistd.h>  // close
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <iostream>
+#include <thread>
 
 namespace
 {
 constexpr MppPollType kPollTimeout500Ms = static_cast<MppPollType>(500);
+constexpr auto        kHolderWaitInterval = std::chrono::milliseconds(100);
 
 inline uint32_t Align16(uint32_t value) { return (value + 15u) & ~15u; }
 
@@ -448,11 +451,24 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         return -1;
     }
 
-    holder = AcquireDecodedTaskHolder();
-    if (!holder)
+    bool holder_wait_logged = false;
+    while (!holder)
     {
-        std::cerr << "No free decoded holder available, skip this frame" << std::endl;
-        return -1;
+        holder = AcquireDecodedTaskHolder();
+        if (holder)
+        {
+            break;
+        }
+
+        if (!holder_wait_logged)
+        {
+            std::cerr << "No free decoded holder available, wait "
+                      << kHolderWaitInterval.count() << "ms and retry" << std::endl;
+            holder_wait_logged = true;
+        }
+
+        std::this_thread::sleep_for(kHolderWaitInterval);
+        DrainPendingRecycleQueue();
     }
 
     MppBuffer out_buf_local           = nullptr;
