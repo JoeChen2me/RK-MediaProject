@@ -47,6 +47,136 @@ MppInstance::MppInstance()
     }
     OutBufFD2Index_Map.clear();  // 初始化映射表
     CurrentOutputDesc = nullptr;
+    for (auto& holder : HolderPool)
+    {
+        holder.output_desc  = nullptr;
+        holder.output_frame = nullptr;
+        holder.output_buf   = nullptr;
+        FreeHolderQueue.push_back(&holder);
+    }
+    PendingRecycleQueue.clear();
+    OutDesc2HolderMap.clear();
+}
+
+MppInstance::DecodedTaskHolder* MppInstance::AcquireDecodedTaskHolder()
+{
+    std::lock_guard<std::mutex> lock(HolderMutex);
+    if (FreeHolderQueue.empty())
+    {
+        return nullptr;
+    }
+    DecodedTaskHolder* holder = FreeHolderQueue.front();
+    FreeHolderQueue.pop_front();
+    return holder;
+}
+
+void MppInstance::ReturnDecodedTaskHolder(DecodedTaskHolder* holder)
+{
+    if (!holder)
+    {
+        return;
+    }
+    holder->output_desc   = nullptr;
+    holder->output_frame  = nullptr;
+    holder->output_buf    = nullptr;
+
+    std::lock_guard<std::mutex> lock(HolderMutex);
+    FreeHolderQueue.push_back(holder);
+}
+
+void MppInstance::ReleaseTaskPacket(MppTask task)
+{
+    if (!task)
+    {
+        return;
+    }
+
+    MppPacket packet_from_task = nullptr;
+    if (mpp_task_meta_get_packet(task, KEY_INPUT_PACKET, &packet_from_task) == MPP_OK &&
+        packet_from_task)
+    {
+        mpp_packet_deinit(&packet_from_task);
+    }
+}
+
+void MppInstance::RecycleDecodedTaskHolder(DecodedTaskHolder* holder)
+{
+    if (!holder)
+    {
+        return;
+    }
+
+    if (holder->output_frame)
+    {
+        mpp_frame_deinit(&holder->output_frame);
+        holder->output_frame = nullptr;
+    }
+    if (holder->output_buf)
+    {
+        mpp_buffer_put(holder->output_buf);
+        holder->output_buf = nullptr;
+    }
+    ReturnDecodedTaskHolder(holder);
+}
+
+void MppInstance::DrainPendingRecycleQueue()
+{
+    std::deque<DecodedTaskHolder*> local_queue;
+    {
+        std::lock_guard<std::mutex> lock(HolderMutex);
+        local_queue.swap(PendingRecycleQueue);
+    }
+    while (!local_queue.empty())
+    {
+        DecodedTaskHolder* holder = local_queue.front();
+        local_queue.pop_front();
+        RecycleDecodedTaskHolder(holder);
+    }
+}
+
+void MppInstance::ForceRecycleAllHolders()
+{
+    std::deque<DecodedTaskHolder*> local_queue;
+    {
+        std::lock_guard<std::mutex> lock(HolderMutex);
+        for (auto& kv : OutDesc2HolderMap)
+        {
+            local_queue.push_back(kv.second);
+        }
+        OutDesc2HolderMap.clear();
+        while (!PendingRecycleQueue.empty())
+        {
+            local_queue.push_back(PendingRecycleQueue.front());
+            PendingRecycleQueue.pop_front();
+        }
+    }
+    while (!local_queue.empty())
+    {
+        DecodedTaskHolder* holder = local_queue.front();
+        local_queue.pop_front();
+        RecycleDecodedTaskHolder(holder);
+    }
+}
+
+int MppInstance::MppQueueOutputForRecycle(const IO_FD_t* output_desc)
+{
+    if (!output_desc)
+    {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(HolderMutex);
+    const auto                  it = OutDesc2HolderMap.find(output_desc);
+    if (it == OutDesc2HolderMap.end())
+    {
+        std::cerr << "Output descriptor is not in-flight, fd="
+                  << ((output_desc) ? output_desc->fd : -1) << std::endl;
+        return -1;
+    }
+
+    PendingRecycleQueue.push_back(it->second);
+    OutDesc2HolderMap.erase(it);
+    return 0;
 }
 
 int MppInstance::MppInit()
@@ -150,7 +280,7 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
         return -1;
     }
     ret = mpp_buffer_group_limit_config(group, OutSize,
-                                        kMaxBufferCount);  // 配置上限，实际缓冲通过 commit 注入
+                                        resource_limits::kMppOutputBufferCount);  // 配置上限，实际缓冲通过 commit 注入
     if (ret != MPP_OK)
     {
         mpp_buffer_group_put(group);
@@ -194,9 +324,9 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
     // 维持 V4L2 index 和 MPP index 一一对应：
     // 每个 FrameDesc 按 index 导入到对应的 MppBuffers[slot]。
     size_t       imported_count = 0;
-    const size_t import_limit   = (frame_desc_count < kMaxImportBuffers)
+    const size_t import_limit   = (frame_desc_count < resource_limits::kMppImportBufferCount)
                                       ? frame_desc_count
-                                      : kMaxImportBuffers;  // 避免越界访问
+                                      : resource_limits::kMppImportBufferCount;  // 避免越界访问
     for (size_t i = 0; i < import_limit; ++i)               // 遍历
     {
         const FrameDesc& frame_desc = frame_desc_array[i];  // 引用当前帧描述，避免不必要的拷贝
@@ -206,7 +336,7 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
         }
 
         const int slot = frame_desc.index;
-        if (slot < 0 || static_cast<size_t>(slot) >= kMaxImportBuffers)
+        if (slot < 0 || static_cast<size_t>(slot) >= resource_limits::kMppImportBufferCount)
         {
             std::cerr << "Invalid frame index for MPP import, index=" << slot
                       << ", fd=" << frame_desc.fd << std::endl;
@@ -267,9 +397,14 @@ int MppInstance::MppConfigWidthHeight(uint32_t width, uint32_t height)
 
 int MppInstance::MppDecode(const FrameDesc* frame_desc)
 {
+    // 先回收上一轮挂起的输出任务，确保 frame/buf 生命周期由业务控制（至少延后一轮）。
+    DrainPendingRecycleQueue();
+
     MPP_RET ret               = MPP_NOK;
     int     outbuf_fd         = -1;
     size_t  MappedBufferIndex = 0;
+    IO_FD_t*          output_desc   = nullptr;
+    DecodedTaskHolder* holder       = nullptr;
 
     CurrentOutputDesc = nullptr;
 
@@ -286,7 +421,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     {
         return -1;
     }
-    if (buffer_index < 0 || static_cast<size_t>(buffer_index) >= kMaxImportBuffers)
+    if (buffer_index < 0 || static_cast<size_t>(buffer_index) >= resource_limits::kMppImportBufferCount)
     {
         std::cerr << "Invalid input buffer index for decode: " << buffer_index << std::endl;
         return -1;
@@ -313,6 +448,13 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         return -1;
     }
 
+    holder = AcquireDecodedTaskHolder();
+    if (!holder)
+    {
+        std::cerr << "No free decoded holder available, skip this frame" << std::endl;
+        return -1;
+    }
+
     MppBuffer out_buf_local           = nullptr;
     MppFrame  out_frm_local           = nullptr;
     MppFrame  decoded_frame           = nullptr;
@@ -320,20 +462,6 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     MppTask   input_task              = nullptr;
     MppTask   output_task             = nullptr;
     bool      input_task_is_submitted = false;
-
-    auto release_task_packet = [&](MppTask task)
-    {
-        MppPacket packet_from_task = nullptr;
-        if (mpp_task_meta_get_packet(task, KEY_INPUT_PACKET, &packet_from_task) == MPP_OK &&
-            packet_from_task)
-        {
-            if (packet_from_task == packet_local)
-            {
-                packet_local = nullptr;
-            }
-            mpp_packet_deinit(&packet_from_task);
-        }
-    };
 
     auto release_local_resources = [&]()
     {
@@ -418,6 +546,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     }
     input_task_is_submitted = true;
     input_task              = nullptr;
+    packet_local            = nullptr;  // packet 已交给 input task，后续在回收该 task 时释放
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_OUTPUT, kPollTimeout500Ms);
     if (ret < 0)
@@ -439,13 +568,22 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
 
     if (mpp_frame_get_info_change(decoded_frame))
     {
+        {
+            std::lock_guard<std::mutex> lock(HolderMutex);
+            if (!OutDesc2HolderMap.empty())
+            {
+                std::cerr << "Info change detected while outputs are still in-flight, inflight="
+                          << OutDesc2HolderMap.size() << std::endl;
+                goto fail;
+            }
+        }
         // 模式三：info change 后重建外部输出缓冲池并重新绑定到解码器
         size_t buf_size = mpp_frame_get_buf_size(decoded_frame);
         OutSize =
             (OutSize > buf_size)
                 ? OutSize
                 : buf_size;  // 更新输出缓冲大小，取当前值和解码器要求的最大值，避免过小导致后续解码失败
-        ret = mpp_buffer_group_limit_config(group, OutSize, kMaxBufferCount);  // 更新缓冲上限配置
+        ret = mpp_buffer_group_limit_config(group, OutSize, resource_limits::kMppOutputBufferCount);  // 更新缓冲上限配置
         if (ret != MPP_OK)
         {
             goto fail;
@@ -487,7 +625,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         MappedBufferIndex = out_it->second;  // 查找输出 fd 对应的 MPP 缓冲索引
     }
     {
-        if (MappedBufferIndex >= kMaxBufferCount)
+        if (MappedBufferIndex >= resource_limits::kMppOutputBufferCount)
         {
             std::cerr << "Mapped output index out of range: " << MappedBufferIndex << std::endl;
             goto fail;
@@ -509,26 +647,19 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         output_info.height     = static_cast<uint32_t>(frame_height);
         output_info.hor_stride = static_cast<uint32_t>(frame_hs);
         output_info.ver_stride = static_cast<uint32_t>(frame_vs);
-        CurrentOutputDesc = &output_info;
+        output_desc            = &output_info;
+        CurrentOutputDesc      = output_desc;
     }
 
-    /**
-     *
-     * 到这里说明成功实现了解码，接下来便是收尾工作
-     *
-     */
-
-    ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, output_task);  // 归还输出任务
+    // 输出任务不再延迟，先归还任务通道，避免阻塞后续解码。
+    ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, output_task);
     if (ret != MPP_OK)
     {
         goto fail;
     }
     output_task = nullptr;
 
-    /**
-     * 输出任务归还后继续轮询输入端，确保输入任务被正确回收并释放相关资源，避免内存泄漏或资源占用过高的情况
-     * 直接只做一次提交的话，会出现存在未被回收的 packet 资源
-     */
+    // 立即回收输入端 task 并释放 packet，保持输入端任务流畅。
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);
     if (ret < 0)
     {
@@ -540,18 +671,32 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     {
         goto fail;
     }
-
-    release_task_packet(input_task);
-
+    input_task_is_submitted = false;
+    ReleaseTaskPacket(input_task);
     ret = mpp_api->enqueue(mpp_ctx, MPP_PORT_INPUT, input_task);
     if (ret != MPP_OK)
     {
         goto fail;
     }
-    input_task_is_submitted = false;
-    input_task              = nullptr;
+    input_task = nullptr;
 
-    release_local_resources();
+    holder->output_desc  = output_desc;
+    holder->output_frame = out_frm_local;
+    holder->output_buf   = out_buf_local;
+    {
+        std::lock_guard<std::mutex> lock(HolderMutex);
+        if (OutDesc2HolderMap.find(output_desc) != OutDesc2HolderMap.end())
+        {
+            std::cerr << "Duplicate in-flight output descriptor detected, fd="
+                      << ((output_desc) ? output_desc->fd : -1) << std::endl;
+            goto fail;
+        }
+        OutDesc2HolderMap[output_desc] = holder;
+    }
+
+    out_frm_local  = nullptr;
+    out_buf_local  = nullptr;
+    holder         = nullptr;
     return 0;
 
 fail:
@@ -563,7 +708,7 @@ fail:
     }
     if (input_task)
     {
-        release_task_packet(input_task);
+        ReleaseTaskPacket(input_task);
         (void)mpp_api->enqueue(mpp_ctx, MPP_PORT_INPUT, input_task);
         input_task = nullptr;
     }
@@ -574,18 +719,23 @@ fail:
         if (mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, MPP_POLL_NON_BLOCK) >= 0 &&
             mpp_api->dequeue(mpp_ctx, MPP_PORT_INPUT, &recycle_task) == MPP_OK && recycle_task)
         {
-            release_task_packet(recycle_task);
+            ReleaseTaskPacket(recycle_task);
             (void)mpp_api->enqueue(mpp_ctx, MPP_PORT_INPUT, recycle_task);
         }
     }
 
     release_local_resources();
+    ReturnDecodedTaskHolder(holder);
+    holder = nullptr;
 
     return -1;
 }
 
 MppInstance::~MppInstance()
 {
+    ForceRecycleAllHolders();
+    DrainPendingRecycleQueue();
+
     for (auto& buffer : MppBuffers)
     {
         if (buffer)
@@ -659,6 +809,10 @@ int MppInstance::AllocDmaBufFD(IO_FD_t& output, size_t size)
 
 void MppInstance::ReleaseExternalOutputBuffers()
 {
+    // 外部输出缓冲重建或析构前，先把挂起的输出 task/frame/buf 全部归还。
+    ForceRecycleAllHolders();
+    DrainPendingRecycleQueue();
+
     for (auto& output : MppOutputFDList)
     {
         if (output.base && output.size > 0)
@@ -696,6 +850,18 @@ int MppInstance::CommitExternalOutputBuffers(size_t size)
         return -1;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(HolderMutex);
+        if (!OutDesc2HolderMap.empty())
+        {
+            std::cerr << "Can not commit external buffers while outputs are in-flight, inflight="
+                      << OutDesc2HolderMap.size() << std::endl;
+            return -1;
+        }
+    }
+
+    DrainPendingRecycleQueue();
+
     // 先清理组里旧的可复用缓冲，再释放本地记录的 fd。
     MPP_RET ret = mpp_buffer_group_clear(group);
     if (ret != MPP_OK)
@@ -708,7 +874,7 @@ int MppInstance::CommitExternalOutputBuffers(size_t size)
     commit.type = MPP_BUFFER_TYPE_EXT_DMA;
     commit.size = size;
 
-    for (size_t i = 0; i < kMaxBufferCount; ++i)
+    for (size_t i = 0; i < resource_limits::kMppOutputBufferCount; ++i)
     {
         IO_FD_t& output = MppOutputFDList[i];
         if (AllocDmaBufFD(output, size) != 0)
