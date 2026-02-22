@@ -215,7 +215,7 @@ int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
         return 0;
     }
 
-    for (size_t i = 0; i < kOutputPoolCount; ++i)
+    for (size_t i = 0; i < resource_limits::kRgaOutputBufferCount; ++i)
     {
         IO_FD_t& out = output_pool_[i];
         if (AllocDmaBufFD(&out, need) != 0)
@@ -253,7 +253,7 @@ IO_FD_t* RgaInstance::AcquireOutputPoolBuffer()
     }
 
     IO_FD_t* out       = &output_pool_[output_pool_index_];
-    output_pool_index_ = (output_pool_index_ + 1) % kOutputPoolCount;
+    output_pool_index_ = (output_pool_index_ + 1) % resource_limits::kRgaOutputBufferCount;
     return out;
 }
 

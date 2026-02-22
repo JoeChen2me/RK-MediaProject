@@ -3,6 +3,20 @@
 
 #include <cstddef>
 #include <cstdint>
+
+namespace resource_limits
+{
+// 全局资源池上限，按未来 H.264/H.265 参考帧场景预留。
+inline constexpr size_t kMaxAllocaSize = 35U;
+
+// 相机、MPP、RGA 的资源规模统一在此集中配置。
+inline constexpr size_t kCameraRequestBufferCount = 4U;
+inline constexpr size_t kCameraMappedBufferCount  = kMaxAllocaSize;
+inline constexpr size_t kMppImportBufferCount     = kMaxAllocaSize;
+inline constexpr size_t kMppOutputBufferCount     = kMaxAllocaSize;
+inline constexpr size_t kRgaOutputBufferCount     = kMaxAllocaSize;
+}  // namespace resource_limits
+
 // 用于在相机和 MPP 之间传递帧缓冲描述信息，包含必要的 fd、尺寸和有效载荷大小等字段。
 struct FrameDesc
 {

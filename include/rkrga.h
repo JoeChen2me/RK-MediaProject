@@ -49,8 +49,7 @@ class RgaInstance
     const IO_FD_t* TransformInternal(const IO_FD_t* src, Operation op);
     size_t         CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) const;
     bool                    initialized_                   = false;
-    static constexpr size_t kOutputPoolCount               = 20U;
-    IO_FD_t                 output_pool_[kOutputPoolCount] = {};
+    IO_FD_t                 output_pool_[resource_limits::kRgaOutputBufferCount] = {};
     bool                    output_pool_ready_             = false;
     size_t                  output_pool_index_             = 0;
 };
