@@ -31,11 +31,12 @@ class MppInstance
     int MppDecode(const FrameDesc* frame_desc);
 
     MppBuffer MppBuffers[kMaxImportBuffers] = {nullptr};  // 存储导入的输入缓冲句柄
+    const IO_FD_t* CurrentOutputDesc = nullptr;           // 当前解码完成并可供后续消费的输出描述
 
    private:
-    int  AllocDmaBufFD(MppOutputFD& output, size_t size);  // 分配并映射一个 dma-buf
-    int  CommitExternalOutputBuffers(size_t size);         // 按指定大小提交外部输出缓冲到 group
-    void ReleaseExternalOutputBuffers();                   // 释放外部输出缓冲 fd
+    int  AllocDmaBufFD(IO_FD_t& output, size_t size);  // 分配并映射一个 dma-buf
+    int  CommitExternalOutputBuffers(size_t size);     // 按指定大小提交外部输出缓冲到 group
+    void ReleaseExternalOutputBuffers();               // 释放外部输出缓冲 fd
 
     MppCtx         mpp_ctx                          = nullptr;  // 复用的 MPP 解码上下文
     MppApi*        mpp_api                          = nullptr;  // 复用的 MPP API 入口
@@ -45,7 +46,7 @@ class MppInstance
     uint32_t       H_Stride                         = 0;        // 行对齐
     uint32_t       V_Stride                         = 0;        // 列对齐
     size_t         OutSize                          = 0;        // 单帧输出缓冲大小
-    MppOutputFD    MppOutputFDList[kMaxBufferCount] = {};  // 存储输出缓冲的详细信息,包含完整信息
+    IO_FD_t        MppOutputFDList[kMaxBufferCount] = {};  // 存储输出缓冲的详细信息,包含完整信息
     std::map<int, size_t> OutBufFD2Index_Map;  // 记录输出 dma-buf fd 到缓冲索引的映射关系
 };
 

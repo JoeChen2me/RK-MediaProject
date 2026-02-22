@@ -6,6 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace
+{
+constexpr const char* kRgaDmaHeapPath = "/dev/dma_heap/system";
+}
+
 class RgaInstance
 {
    public:
@@ -13,38 +18,9 @@ class RgaInstance
     ~RgaInstance();
 
     int RgaInit();
-
-    // 申请并映射一个输出 dma-buf，结果写入 output。
-    int AllocDmaBufFD(MppOutputFD* output, size_t size,
-                      const char* heap_path = "/dev/dma_heap/system");
-    // 确保 output 至少有 min_size 大小的 dma-buf；不足时重新申请。
-    int EnsureDmaBufFD(MppOutputFD* output, size_t min_size,
-                       const char* heap_path = "/dev/dma_heap/system");
-    // 释放 output 对应的 mmap 和 fd。
-    void ReleaseDmaBufFD(MppOutputFD* output);
-
-    // 固定分辨率场景下推荐在初始化阶段设置一次输入/输出图像参数。
-    int SetInputImageConfig(uint32_t width, uint32_t height, uint32_t h_stride,
-                            uint32_t v_stride);
-    int SetOutputImageConfig(uint32_t width, uint32_t height, uint32_t h_stride,
-                             uint32_t v_stride);
-
-    // 使用类内配置执行 blit：配置一致走 copy，不一致走 resize（固定 NV12，不做 csc）。
-    int Blit(const MppOutputFD* src, MppOutputFD* dst,
-             const char* output_heap_path = "/dev/dma_heap/system");
-    // 便捷接口：语义上用于同格式拷贝；若输入输出配置不同会退化为 resize。
-    int Copy(const MppOutputFD* src, MppOutputFD* dst,
-             const char* output_heap_path = "/dev/dma_heap/system");
-    // 缩放到 output 配置尺寸。
-    int Resize(const MppOutputFD* src, MppOutputFD* dst,
-               const char* output_heap_path = "/dev/dma_heap/system");
-    // 旋转（仅支持 90/180/270 度）。
-    int Rotate(const MppOutputFD* src, MppOutputFD* dst, int angle_deg,
-               const char* output_heap_path = "/dev/dma_heap/system");
-    // 裁剪：截取输入图像中 [x, y, crop_width, crop_height] 区域，输出为该区域大小，不做缩放。
-    int Crop(const MppOutputFD* src, MppOutputFD* dst, uint32_t x, uint32_t y,
-             uint32_t crop_width, uint32_t crop_height,
-             const char* output_heap_path = "/dev/dma_heap/system");
+    const IO_FD_t* Copy(const IO_FD_t* src);
+    const IO_FD_t* FlipHorizontal(const IO_FD_t* src);
+    const IO_FD_t* FlipVertical(const IO_FD_t* src);
 
    private:
     struct ImageConfig
@@ -56,14 +32,27 @@ class RgaInstance
         bool     valid    = false;
     };
 
-    bool   IsConfigValid(const ImageConfig& cfg) const;
-    size_t CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) const;
-    int    BlitWithConfig(const MppOutputFD* src, const ImageConfig& src_cfg, MppOutputFD* dst,
-                          const ImageConfig& dst_cfg, const char* output_heap_path);
+    enum class Operation
+    {
+        kCopy,
+        kFlipHorizontal,
+        kFlipVertical,
+    };
 
-    ImageConfig input_cfg_{};
-    ImageConfig output_cfg_{};
-    bool initialized_ = false;
+    int            AllocDmaBufFD(IO_FD_t* output, size_t size);
+    void           ReleaseDmaBufFD(IO_FD_t* output);
+    bool           IsConfigValid(const ImageConfig& cfg) const;
+    bool           LoadConfigFromIO(const IO_FD_t* io, ImageConfig* cfg) const;
+    int            InitOutputPoolIfNeeded(const ImageConfig& src_cfg);
+    void           ReleaseOutputPool();
+    IO_FD_t*       AcquireOutputPoolBuffer();
+    const IO_FD_t* TransformInternal(const IO_FD_t* src, Operation op);
+    size_t         CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) const;
+    bool                    initialized_                   = false;
+    static constexpr size_t kOutputPoolCount               = 20U;
+    IO_FD_t                 output_pool_[kOutputPoolCount] = {};
+    bool                    output_pool_ready_             = false;
+    size_t                  output_pool_index_             = 0;
 };
 
 #endif  // RK_RGA_H

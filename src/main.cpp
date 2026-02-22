@@ -65,21 +65,6 @@ int main()
         std::cerr << "Failed to initialize RGA instance" << std::endl;
         return 1;
     }
-    auto align16 = [](uint32_t value) { return (value + 15u) & ~15u; };
-    const uint32_t cap_w      = active_cfg.width;
-    const uint32_t cap_h      = active_cfg.height;
-    const uint32_t cap_hs     = align16(cap_w);
-    const uint32_t cap_vs     = align16(cap_h);
-    if (rga_instance.SetInputImageConfig(cap_w, cap_h, cap_hs, cap_vs) != 0)
-    {
-        std::cerr << "Failed to configure RGA input image params" << std::endl;
-        return 1;
-    }
-    if (rga_instance.SetOutputImageConfig(cap_w, cap_h, cap_hs, cap_vs) != 0)
-    {
-        std::cerr << "Failed to configure RGA output image params" << std::endl;
-        return 1;
-    }
 
     std::mutex              ready_mutex;
     std::mutex              recycle_mutex;
@@ -241,6 +226,12 @@ int main()
                 }
                 else
                 {
+                    const IO_FD_t* decoded_output = mpp_instance.CurrentOutputDesc;
+                    if (!decoded_output || decoded_output->width == 0 || decoded_output->height == 0 ||
+                        decoded_output->hor_stride == 0 || decoded_output->ver_stride == 0)
+                    {
+                        std::cerr << "Decoded output metadata is invalid" << std::endl;
+                    }
                     std::cout << "Frame captured and decoded successfully, length: "
                               << frame_desc->payloadSize << " bytes" << std::endl;
                 }

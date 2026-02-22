@@ -37,11 +37,16 @@ MppInstance::MppInstance()
 {
     for (auto& fd_info : MppOutputFDList)
     {
-        fd_info.fd   = -1;
-        fd_info.base = nullptr;
-        fd_info.size = 0;
+        fd_info.fd         = -1;
+        fd_info.base       = nullptr;
+        fd_info.size       = 0;
+        fd_info.width      = 0;
+        fd_info.height     = 0;
+        fd_info.hor_stride = 0;
+        fd_info.ver_stride = 0;
     }
     OutBufFD2Index_Map.clear();  // 初始化映射表
+    CurrentOutputDesc = nullptr;
 }
 
 int MppInstance::MppInit()
@@ -264,7 +269,9 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
 {
     MPP_RET ret               = MPP_NOK;
     int     outbuf_fd         = -1;
-    size_t  MappedBufferIndex = -1;
+    size_t  MappedBufferIndex = 0;
+
+    CurrentOutputDesc = nullptr;
 
     if (!frame_desc)
     {
@@ -479,7 +486,31 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         }
         MappedBufferIndex = out_it->second;  // 查找输出 fd 对应的 MPP 缓冲索引
     }
-    // TODO 等待后续手动实现后续内容。
+    {
+        if (MappedBufferIndex >= kMaxBufferCount)
+        {
+            std::cerr << "Mapped output index out of range: " << MappedBufferIndex << std::endl;
+            goto fail;
+        }
+        const RK_S32 frame_width  = mpp_frame_get_width(decoded_frame);
+        const RK_S32 frame_height = mpp_frame_get_height(decoded_frame);
+        const RK_S32 frame_hs     = mpp_frame_get_hor_stride(decoded_frame);
+        const RK_S32 frame_vs     = mpp_frame_get_ver_stride(decoded_frame);
+        if (frame_width <= 0 || frame_height <= 0 || frame_hs <= 0 || frame_vs <= 0)
+        {
+            std::cerr << "Invalid decoded frame geometry: w=" << frame_width
+                      << ", h=" << frame_height << ", hs=" << frame_hs << ", vs=" << frame_vs
+                      << std::endl;
+            goto fail;
+        }
+
+        IO_FD_t& output_info = MppOutputFDList[MappedBufferIndex];
+        output_info.width      = static_cast<uint32_t>(frame_width);
+        output_info.height     = static_cast<uint32_t>(frame_height);
+        output_info.hor_stride = static_cast<uint32_t>(frame_hs);
+        output_info.ver_stride = static_cast<uint32_t>(frame_vs);
+        CurrentOutputDesc = &output_info;
+    }
 
     /**
      *
@@ -524,6 +555,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     return 0;
 
 fail:
+    CurrentOutputDesc = nullptr;
     if (output_task)
     {
         (void)mpp_api->enqueue(mpp_ctx, MPP_PORT_OUTPUT, output_task);
@@ -578,7 +610,7 @@ MppInstance::~MppInstance()
     }
 }
 
-int MppInstance::AllocDmaBufFD(MppOutputFD& output, size_t size)
+int MppInstance::AllocDmaBufFD(IO_FD_t& output, size_t size)
 {
     if (size == 0)
     {
@@ -615,9 +647,13 @@ int MppInstance::AllocDmaBufFD(MppOutputFD& output, size_t size)
         return -1;
     }
 
-    output.fd   = req.fd;
-    output.base = mapped_base;
-    output.size = size;
+    output.fd         = req.fd;
+    output.base       = mapped_base;
+    output.size       = size;
+    output.width      = 0;
+    output.height     = 0;
+    output.hor_stride = 0;
+    output.ver_stride = 0;
     return 0;
 }
 
@@ -644,8 +680,13 @@ void MppInstance::ReleaseExternalOutputBuffers()
             }
             output.fd = -1;
         }
+        output.width      = 0;
+        output.height     = 0;
+        output.hor_stride = 0;
+        output.ver_stride = 0;
     }
     OutBufFD2Index_Map.clear();  // 清空 fd 到输出缓冲索引的映射
+    CurrentOutputDesc = nullptr;
 }
 
 int MppInstance::CommitExternalOutputBuffers(size_t size)
@@ -669,7 +710,7 @@ int MppInstance::CommitExternalOutputBuffers(size_t size)
 
     for (size_t i = 0; i < kMaxBufferCount; ++i)
     {
-        MppOutputFD& output = MppOutputFDList[i];
+        IO_FD_t& output = MppOutputFDList[i];
         if (AllocDmaBufFD(output, size) != 0)
         {
             (void)mpp_buffer_group_clear(group);

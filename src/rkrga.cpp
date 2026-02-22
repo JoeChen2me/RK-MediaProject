@@ -12,17 +12,12 @@
 
 #include <im2d.h>
 #include <im2d_buffer.h>
-#include <im2d_common.h>
-#include <im2d_single.h>
-#include <rga.h>
 
 namespace
 {
 constexpr int kRgaFormatNv12 = RK_FORMAT_YCbCr_420_SP;
 
-inline uint32_t Align16(uint32_t value) { return (value + 15u) & ~15u; }
-
-int BuildRgaBuffer(const MppOutputFD* buffer, uint32_t width, uint32_t height, uint32_t h_stride,
+int BuildRgaBuffer(const IO_FD_t* buffer, uint32_t width, uint32_t height, uint32_t h_stride,
                    uint32_t v_stride, rga_buffer_t* out, rga_buffer_handle_t* handle)
 {
     if (!buffer || !out || !handle || width == 0 || height == 0 || h_stride == 0 || v_stride == 0)
@@ -64,9 +59,21 @@ void ReleaseRgaHandle(rga_buffer_handle_t& handle)
 }
 }  // namespace
 
-RgaInstance::RgaInstance() = default;
+RgaInstance::RgaInstance()
+{
+    for (auto& item : output_pool_)
+    {
+        item.fd         = -1;
+        item.base       = nullptr;
+        item.size       = 0;
+        item.width      = 0;
+        item.height     = 0;
+        item.hor_stride = 0;
+        item.ver_stride = 0;
+    }
+}
 
-RgaInstance::~RgaInstance() = default;
+RgaInstance::~RgaInstance() { ReleaseOutputPool(); }
 
 int RgaInstance::RgaInit()
 {
@@ -81,20 +88,20 @@ int RgaInstance::RgaInit()
     return 0;
 }
 
-int RgaInstance::AllocDmaBufFD(MppOutputFD* output, size_t size, const char* heap_path)
+int RgaInstance::AllocDmaBufFD(IO_FD_t* output, size_t size)
 {
-    if (!output || !heap_path || size == 0)
+    if (!output || size == 0)
     {
         return -1;
     }
 
     ReleaseDmaBufFD(output);
 
-    int heap = open(heap_path, O_RDWR | O_CLOEXEC);
+    int heap = open(kRgaDmaHeapPath, O_RDWR | O_CLOEXEC);
     if (heap < 0)
     {
-        std::cerr << "Failed to open dma_heap(" << heap_path
-                  << "): " << std::strerror(errno) << std::endl;
+        std::cerr << "Failed to open dma_heap(" << kRgaDmaHeapPath << "): " << std::strerror(errno)
+                  << std::endl;
         return -1;
     }
 
@@ -119,28 +126,17 @@ int RgaInstance::AllocDmaBufFD(MppOutputFD* output, size_t size, const char* hea
         return -1;
     }
 
-    output->fd   = req.fd;
-    output->base = mapped_base;
-    output->size = size;
+    output->fd         = req.fd;
+    output->base       = mapped_base;
+    output->size       = size;
+    output->width      = 0;
+    output->height     = 0;
+    output->hor_stride = 0;
+    output->ver_stride = 0;
     return 0;
 }
 
-int RgaInstance::EnsureDmaBufFD(MppOutputFD* output, size_t min_size, const char* heap_path)
-{
-    if (!output || min_size == 0)
-    {
-        return -1;
-    }
-
-    if (output->fd >= 0 && output->size >= min_size)
-    {
-        return 0;
-    }
-
-    return AllocDmaBufFD(output, min_size, heap_path);
-}
-
-void RgaInstance::ReleaseDmaBufFD(MppOutputFD* output)
+void RgaInstance::ReleaseDmaBufFD(IO_FD_t* output)
 {
     if (!output)
     {
@@ -157,7 +153,11 @@ void RgaInstance::ReleaseDmaBufFD(MppOutputFD* output)
         (void)close(output->fd);
         output->fd = -1;
     }
-    output->size = 0;
+    output->size       = 0;
+    output->width      = 0;
+    output->height     = 0;
+    output->hor_stride = 0;
+    output->ver_stride = 0;
 }
 
 bool RgaInstance::IsConfigValid(const ImageConfig& cfg) const
@@ -165,34 +165,23 @@ bool RgaInstance::IsConfigValid(const ImageConfig& cfg) const
     return cfg.valid && cfg.width > 0 && cfg.height > 0 && cfg.h_stride > 0 && cfg.v_stride > 0;
 }
 
-int RgaInstance::SetInputImageConfig(uint32_t width, uint32_t height, uint32_t h_stride,
-                                     uint32_t v_stride)
+bool RgaInstance::LoadConfigFromIO(const IO_FD_t* io, ImageConfig* cfg) const
 {
-    if (width == 0 || height == 0 || h_stride == 0 || v_stride == 0)
+    if (!io || !cfg)
     {
-        return -1;
+        return false;
     }
-    input_cfg_.width    = width;
-    input_cfg_.height   = height;
-    input_cfg_.h_stride = h_stride;
-    input_cfg_.v_stride = v_stride;
-    input_cfg_.valid    = true;
-    return 0;
-}
+    if (io->width == 0 || io->height == 0 || io->hor_stride == 0 || io->ver_stride == 0)
+    {
+        return false;
+    }
 
-int RgaInstance::SetOutputImageConfig(uint32_t width, uint32_t height, uint32_t h_stride,
-                                      uint32_t v_stride)
-{
-    if (width == 0 || height == 0 || h_stride == 0 || v_stride == 0)
-    {
-        return -1;
-    }
-    output_cfg_.width    = width;
-    output_cfg_.height   = height;
-    output_cfg_.h_stride = h_stride;
-    output_cfg_.v_stride = v_stride;
-    output_cfg_.valid    = true;
-    return 0;
+    cfg->width    = io->width;
+    cfg->height   = io->height;
+    cfg->h_stride = io->hor_stride;
+    cfg->v_stride = io->ver_stride;
+    cfg->valid    = true;
+    return true;
 }
 
 size_t RgaInstance::CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) const
@@ -200,36 +189,111 @@ size_t RgaInstance::CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) cons
     return static_cast<size_t>(h_stride) * static_cast<size_t>(v_stride) * 3u / 2u;
 }
 
-int RgaInstance::BlitWithConfig(const MppOutputFD* src, const ImageConfig& src_cfg,
-                                MppOutputFD* dst, const ImageConfig& dst_cfg,
-                                const char* output_heap_path)
+int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
 {
-    if (!initialized_ && RgaInit() != 0)
+    if (!IsConfigValid(src_cfg))
     {
-        return -1;
-    }
-    if (!src || !dst)
-    {
-        return -1;
-    }
-    if (!IsConfigValid(src_cfg) || !IsConfigValid(dst_cfg))
-    {
+        std::cerr << "Failed to initialize output pool: source config is invalid" << std::endl;
         return -1;
     }
 
+    const size_t need = CalcNv12ImageSize(src_cfg.h_stride, src_cfg.v_stride);
+    if (output_pool_ready_)
+    {
+        const IO_FD_t& ref = output_pool_[0];
+        if (ref.width != src_cfg.width || ref.height != src_cfg.height ||
+            ref.hor_stride != src_cfg.h_stride || ref.ver_stride != src_cfg.v_stride ||
+            ref.size < need)
+        {
+            std::cerr << "RGA output pool geometry mismatch with source, expect " << src_cfg.width
+                      << "x" << src_cfg.height << " stride(" << src_cfg.h_stride << ","
+                      << src_cfg.v_stride << "), pool has " << ref.width << "x" << ref.height
+                      << " stride(" << ref.hor_stride << "," << ref.ver_stride << ")"
+                      << ", size=" << ref.size << ", need=" << need << std::endl;
+            return -1;
+        }
+        return 0;
+    }
+
+    for (size_t i = 0; i < kOutputPoolCount; ++i)
+    {
+        IO_FD_t& out = output_pool_[i];
+        if (AllocDmaBufFD(&out, need) != 0)
+        {
+            std::cerr << "Failed to allocate output pool buffer, index=" << i << std::endl;
+            ReleaseOutputPool();
+            return -1;
+        }
+        out.width      = src_cfg.width;
+        out.height     = src_cfg.height;
+        out.hor_stride = src_cfg.h_stride;
+        out.ver_stride = src_cfg.v_stride;
+    }
+
+    output_pool_ready_ = true;
+    output_pool_index_ = 0;
+    return 0;
+}
+
+void RgaInstance::ReleaseOutputPool()
+{
+    for (auto& out : output_pool_)
+    {
+        ReleaseDmaBufFD(&out);
+    }
+    output_pool_ready_ = false;
+    output_pool_index_ = 0;
+}
+
+IO_FD_t* RgaInstance::AcquireOutputPoolBuffer()
+{
+    if (!output_pool_ready_)
+    {
+        return nullptr;
+    }
+
+    IO_FD_t* out       = &output_pool_[output_pool_index_];
+    output_pool_index_ = (output_pool_index_ + 1) % kOutputPoolCount;
+    return out;
+}
+
+const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
+{
+    if (!initialized_)
+    {
+        std::cerr << "RGA is not initialized, call RgaInit first" << std::endl;
+        return nullptr;
+    }
+    if (!src)
+    {
+        return nullptr;
+    }
+
+    ImageConfig src_cfg{};
+    if (!LoadConfigFromIO(src, &src_cfg))
+    {
+        std::cerr << "RGA source config is invalid in source IO_FD_t metadata" << std::endl;
+        return nullptr;
+    }
+
+    if (InitOutputPoolIfNeeded(src_cfg) != 0)
+    {
+        return nullptr;
+    }
+
     const size_t src_need = CalcNv12ImageSize(src_cfg.h_stride, src_cfg.v_stride);
-    const size_t dst_need = CalcNv12ImageSize(dst_cfg.h_stride, dst_cfg.v_stride);
     if (src->size < src_need)
     {
         std::cerr << "RGA source buffer too small, size=" << src->size << ", need=" << src_need
                   << std::endl;
-        return -1;
+        return nullptr;
     }
 
-    if (EnsureDmaBufFD(dst, dst_need, output_heap_path) != 0)
+    IO_FD_t* dst = AcquireOutputPoolBuffer();
+    if (!dst)
     {
-        std::cerr << "Failed to prepare RGA output dma-buf, need=" << dst_need << std::endl;
-        return -1;
+        std::cerr << "RGA output pool is not ready" << std::endl;
+        return nullptr;
     }
 
     rga_buffer_t        src_buffer{};
@@ -240,283 +304,55 @@ int RgaInstance::BlitWithConfig(const MppOutputFD* src, const ImageConfig& src_c
     if (BuildRgaBuffer(src, src_cfg.width, src_cfg.height, src_cfg.h_stride, src_cfg.v_stride,
                        &src_buffer, &src_handle) != 0)
     {
-        std::cerr << "Failed to build RGA source buffer, fd=" << src->fd << ", base=" << src->base
-                  << ", size=" << src->size << std::endl;
-        return -1;
+        std::cerr << "Failed to build RGA source buffer" << std::endl;
+        return nullptr;
     }
 
-    if (BuildRgaBuffer(dst, dst_cfg.width, dst_cfg.height, dst_cfg.h_stride, dst_cfg.v_stride,
+    if (BuildRgaBuffer(dst, src_cfg.width, src_cfg.height, src_cfg.h_stride, src_cfg.v_stride,
                        &dst_buffer, &dst_handle) != 0)
     {
-        if (src_handle)
-        {
-            (void)releasebuffer_handle(src_handle);
-        }
-        std::cerr << "Failed to build RGA destination buffer, fd=" << dst->fd
-                  << ", base=" << dst->base << ", size=" << dst->size << std::endl;
-        return -1;
+        ReleaseRgaHandle(src_handle);
+        std::cerr << "Failed to build RGA destination buffer" << std::endl;
+        return nullptr;
     }
 
     IM_STATUS status = IM_STATUS_FAILED;
-    if (src_cfg.width == dst_cfg.width && src_cfg.height == dst_cfg.height &&
-        src_cfg.h_stride == dst_cfg.h_stride && src_cfg.v_stride == dst_cfg.v_stride)
+    switch (op)
     {
-        status = imcopy(src_buffer, dst_buffer);
-    }
-    else
-    {
-        status = imresize(src_buffer, dst_buffer);
+        case Operation::kCopy:
+            status = imcopy(src_buffer, dst_buffer);
+            break;
+        case Operation::kFlipHorizontal:
+            status = imflip(src_buffer, dst_buffer, IM_HAL_TRANSFORM_FLIP_H);
+            break;
+        case Operation::kFlipVertical:
+            status = imflip(src_buffer, dst_buffer, IM_HAL_TRANSFORM_FLIP_V);
+            break;
+        default:
+            status = IM_STATUS_FAILED;
+            break;
     }
 
-    if (src_handle)
-    {
-        (void)releasebuffer_handle(src_handle);
-    }
-    if (dst_handle)
-    {
-        (void)releasebuffer_handle(dst_handle);
-    }
+    ReleaseRgaHandle(src_handle);
+    ReleaseRgaHandle(dst_handle);
 
     if (status != IM_STATUS_SUCCESS)
     {
         std::cerr << "RGA operation failed: " << imStrError_t(status) << std::endl;
-        return -1;
+        return nullptr;
     }
 
-    return 0;
+    return dst;
 }
 
-int RgaInstance::Blit(const MppOutputFD* src, MppOutputFD* dst, const char* output_heap_path)
+const IO_FD_t* RgaInstance::Copy(const IO_FD_t* src) { return TransformInternal(src, Operation::kCopy); }
+
+const IO_FD_t* RgaInstance::FlipHorizontal(const IO_FD_t* src)
 {
-    if (!IsConfigValid(input_cfg_))
-    {
-        std::cerr << "RGA input image config is not set" << std::endl;
-        return -1;
-    }
-    const ImageConfig& dst_cfg = IsConfigValid(output_cfg_) ? output_cfg_ : input_cfg_;
-    return BlitWithConfig(src, input_cfg_, dst, dst_cfg, output_heap_path);
+    return TransformInternal(src, Operation::kFlipHorizontal);
 }
 
-int RgaInstance::Copy(const MppOutputFD* src, MppOutputFD* dst,
-                      const char* output_heap_path)
+const IO_FD_t* RgaInstance::FlipVertical(const IO_FD_t* src)
 {
-    if (!IsConfigValid(input_cfg_))
-    {
-        std::cerr << "RGA input image config is not set" << std::endl;
-        return -1;
-    }
-
-    ImageConfig dst_cfg = IsConfigValid(output_cfg_) ? output_cfg_ : input_cfg_;
-    return BlitWithConfig(src, input_cfg_, dst, dst_cfg, output_heap_path);
-}
-
-int RgaInstance::Resize(const MppOutputFD* src, MppOutputFD* dst,
-                        const char* output_heap_path)
-{
-    if (!IsConfigValid(input_cfg_) || !IsConfigValid(output_cfg_))
-    {
-        std::cerr << "RGA resize requires both input and output configs" << std::endl;
-        return -1;
-    }
-
-    return BlitWithConfig(src, input_cfg_, dst, output_cfg_, output_heap_path);
-}
-
-int RgaInstance::Rotate(const MppOutputFD* src, MppOutputFD* dst, int angle_deg,
-                        const char* output_heap_path)
-{
-    if (!initialized_ && RgaInit() != 0)
-    {
-        return -1;
-    }
-    if (!src || !dst)
-    {
-        return -1;
-    }
-    if (!IsConfigValid(input_cfg_))
-    {
-        std::cerr << "RGA input image config is not set" << std::endl;
-        return -1;
-    }
-
-    int rotate_mode = 0;
-    if (angle_deg == 90)
-    {
-        rotate_mode = IM_HAL_TRANSFORM_ROT_90;
-    }
-    else if (angle_deg == 180)
-    {
-        rotate_mode = IM_HAL_TRANSFORM_ROT_180;
-    }
-    else if (angle_deg == 270)
-    {
-        rotate_mode = IM_HAL_TRANSFORM_ROT_270;
-    }
-    else
-    {
-        std::cerr << "Unsupported rotate angle: " << angle_deg
-                  << " (only 90/180/270 supported)" << std::endl;
-        return -1;
-    }
-
-    ImageConfig dst_cfg = IsConfigValid(output_cfg_) ? output_cfg_ : input_cfg_;
-    if (angle_deg == 90 || angle_deg == 270)
-    {
-        const uint32_t expected_width    = input_cfg_.height;
-        const uint32_t expected_height   = input_cfg_.width;
-        const uint32_t expected_h_stride = Align16(expected_width);
-        const uint32_t expected_v_stride = Align16(expected_height);
-
-        const bool size_mismatch =
-            (dst_cfg.width != expected_width || dst_cfg.height != expected_height);
-        const bool stride_mismatch =
-            (dst_cfg.h_stride < expected_width || dst_cfg.v_stride < expected_height);
-        if (size_mismatch || stride_mismatch)
-        {
-            std::cerr << "Warning: rotate " << angle_deg << " output config mismatch, configured "
-                      << dst_cfg.width << "x" << dst_cfg.height << " stride(" << dst_cfg.h_stride
-                      << "," << dst_cfg.v_stride << "), auto-adjust to " << expected_width << "x"
-                      << expected_height << " stride(" << expected_h_stride << ","
-                      << expected_v_stride << ")" << std::endl;
-            dst_cfg.width    = expected_width;
-            dst_cfg.height   = expected_height;
-            dst_cfg.h_stride = expected_h_stride;
-            dst_cfg.v_stride = expected_v_stride;
-            dst_cfg.valid    = true;
-        }
-    }
-
-    const size_t src_need = CalcNv12ImageSize(input_cfg_.h_stride, input_cfg_.v_stride);
-    const size_t dst_need = CalcNv12ImageSize(dst_cfg.h_stride, dst_cfg.v_stride);
-    if (src->size < src_need)
-    {
-        std::cerr << "RGA source buffer too small, size=" << src->size << ", need=" << src_need
-                  << std::endl;
-        return -1;
-    }
-    if (EnsureDmaBufFD(dst, dst_need, output_heap_path) != 0)
-    {
-        std::cerr << "Failed to prepare RGA rotate output dma-buf, need=" << dst_need
-                  << std::endl;
-        return -1;
-    }
-
-    rga_buffer_t        src_buffer{};
-    rga_buffer_t        dst_buffer{};
-    rga_buffer_handle_t src_handle = 0;
-    rga_buffer_handle_t dst_handle = 0;
-    if (BuildRgaBuffer(src, input_cfg_.width, input_cfg_.height, input_cfg_.h_stride,
-                       input_cfg_.v_stride, &src_buffer, &src_handle) != 0)
-    {
-        std::cerr << "Failed to build RGA rotate source buffer" << std::endl;
-        return -1;
-    }
-    if (BuildRgaBuffer(dst, dst_cfg.width, dst_cfg.height, dst_cfg.h_stride, dst_cfg.v_stride,
-                       &dst_buffer, &dst_handle) != 0)
-    {
-        ReleaseRgaHandle(src_handle);
-        std::cerr << "Failed to build RGA rotate destination buffer" << std::endl;
-        return -1;
-    }
-
-    IM_STATUS status = imrotate(src_buffer, dst_buffer, rotate_mode);
-    ReleaseRgaHandle(src_handle);
-    ReleaseRgaHandle(dst_handle);
-
-    if (status != IM_STATUS_SUCCESS)
-    {
-        std::cerr << "RGA rotate failed: " << imStrError_t(status) << std::endl;
-        return -1;
-    }
-    return 0;
-}
-
-int RgaInstance::Crop(const MppOutputFD* src, MppOutputFD* dst, uint32_t x, uint32_t y,
-                      uint32_t crop_width, uint32_t crop_height, const char* output_heap_path)
-{
-    if (!initialized_ && RgaInit() != 0)
-    {
-        return -1;
-    }
-    if (!src || !dst)
-    {
-        return -1;
-    }
-    if (!IsConfigValid(input_cfg_))
-    {
-        std::cerr << "RGA input image config is not set" << std::endl;
-        return -1;
-    }
-    if (crop_width == 0 || crop_height == 0)
-    {
-        return -1;
-    }
-
-    // NV12 裁剪要求偶数对齐，避免 UV 面采样错位。
-    if ((x & 1u) || (y & 1u) || (crop_width & 1u) || (crop_height & 1u))
-    {
-        std::cerr << "NV12 crop requires even x/y/width/height, got x=" << x << ", y=" << y
-                  << ", w=" << crop_width << ", h=" << crop_height << std::endl;
-        return -1;
-    }
-    if (x + crop_width > input_cfg_.width || y + crop_height > input_cfg_.height)
-    {
-        std::cerr << "Crop rect out of source bounds" << std::endl;
-        return -1;
-    }
-
-    ImageConfig dst_cfg{};
-    dst_cfg.width    = crop_width;
-    dst_cfg.height   = crop_height;
-    dst_cfg.h_stride = Align16(crop_width);
-    dst_cfg.v_stride = Align16(crop_height);
-    dst_cfg.valid    = true;
-
-    const size_t src_need = CalcNv12ImageSize(input_cfg_.h_stride, input_cfg_.v_stride);
-    const size_t dst_need = CalcNv12ImageSize(dst_cfg.h_stride, dst_cfg.v_stride);
-    if (src->size < src_need)
-    {
-        std::cerr << "RGA source buffer too small, size=" << src->size << ", need=" << src_need
-                  << std::endl;
-        return -1;
-    }
-    if (EnsureDmaBufFD(dst, dst_need, output_heap_path) != 0)
-    {
-        std::cerr << "Failed to prepare RGA crop output dma-buf, need=" << dst_need << std::endl;
-        return -1;
-    }
-
-    rga_buffer_t        src_buffer{};
-    rga_buffer_t        dst_buffer{};
-    rga_buffer_handle_t src_handle = 0;
-    rga_buffer_handle_t dst_handle = 0;
-    if (BuildRgaBuffer(src, input_cfg_.width, input_cfg_.height, input_cfg_.h_stride,
-                       input_cfg_.v_stride, &src_buffer, &src_handle) != 0)
-    {
-        std::cerr << "Failed to build RGA crop source buffer" << std::endl;
-        return -1;
-    }
-    if (BuildRgaBuffer(dst, dst_cfg.width, dst_cfg.height, dst_cfg.h_stride, dst_cfg.v_stride,
-                       &dst_buffer, &dst_handle) != 0)
-    {
-        ReleaseRgaHandle(src_handle);
-        std::cerr << "Failed to build RGA crop destination buffer" << std::endl;
-        return -1;
-    }
-
-    im_rect rect{};
-    rect.x      = static_cast<int>(x);
-    rect.y      = static_cast<int>(y);
-    rect.width  = static_cast<int>(crop_width);
-    rect.height = static_cast<int>(crop_height);
-    IM_STATUS status = imcrop(src_buffer, dst_buffer, rect);
-
-    ReleaseRgaHandle(src_handle);
-    ReleaseRgaHandle(dst_handle);
-    if (status != IM_STATUS_SUCCESS)
-    {
-        std::cerr << "RGA crop failed: " << imStrError_t(status) << std::endl;
-        return -1;
-    }
-    return 0;
+    return TransformInternal(src, Operation::kFlipVertical);
 }
