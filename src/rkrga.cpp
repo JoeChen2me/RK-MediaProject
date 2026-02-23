@@ -17,6 +17,9 @@ namespace
 {
 constexpr int kRgaFormatNv12 = RK_FORMAT_YCbCr_420_SP;
 
+// 注意：这里的 h_stride / v_stride 是沿用本模块历史命名：
+// h_stride -> librga 的 wstride（水平步幅，像素）
+// v_stride -> librga 的 hstride（垂直步幅，像素）
 int BuildRgaBuffer(const IO_FD_t* buffer, uint32_t width, uint32_t height, uint32_t h_stride,
                    uint32_t v_stride, rga_buffer_t* out, rga_buffer_handle_t* handle)
 {
@@ -83,7 +86,7 @@ int RgaInstance::RgaInit()
         std::cerr << "RGA header/runtime check failed: " << imStrError_t(ret) << std::endl;
         return -1;
     }
-
+    std::cout << querystring(RGA_ALL) << std::endl;  // 输出 RGA 完整信息
     initialized_ = true;
     return 0;
 }
@@ -176,9 +179,11 @@ bool RgaInstance::LoadConfigFromIO(const IO_FD_t* io, ImageConfig* cfg) const
         return false;
     }
 
-    cfg->width    = io->width;
-    cfg->height   = io->height;
+    cfg->width  = io->width;
+    cfg->height = io->height;
+    // 历史命名映射：h_stride 保存水平步幅（wstride）。
     cfg->h_stride = io->hor_stride;
+    // 历史命名映射：v_stride 保存垂直步幅（hstride）。
     cfg->v_stride = io->ver_stride;
     cfg->valid    = true;
     return true;
@@ -197,19 +202,19 @@ int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
         return -1;
     }
 
-    const size_t need = CalcNv12ImageSize(src_cfg.h_stride, src_cfg.v_stride);
+    const size_t SizeNeed = CalcNv12ImageSize(src_cfg.h_stride, src_cfg.v_stride);
     if (output_pool_ready_)
     {
         const IO_FD_t& ref = output_pool_[0];
         if (ref.width != src_cfg.width || ref.height != src_cfg.height ||
             ref.hor_stride != src_cfg.h_stride || ref.ver_stride != src_cfg.v_stride ||
-            ref.size < need)
+            ref.size < SizeNeed)
         {
             std::cerr << "RGA output pool geometry mismatch with source, expect " << src_cfg.width
                       << "x" << src_cfg.height << " stride(" << src_cfg.h_stride << ","
                       << src_cfg.v_stride << "), pool has " << ref.width << "x" << ref.height
                       << " stride(" << ref.hor_stride << "," << ref.ver_stride << ")"
-                      << ", size=" << ref.size << ", need=" << need << std::endl;
+                      << ", size=" << ref.size << ", SizeNeed=" << SizeNeed << std::endl;
             return -1;
         }
         return 0;
@@ -218,7 +223,7 @@ int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
     for (size_t i = 0; i < resource_limits::kRgaOutputBufferCount; ++i)
     {
         IO_FD_t& out = output_pool_[i];
-        if (AllocDmaBufFD(&out, need) != 0)
+        if (AllocDmaBufFD(&out, SizeNeed) != 0)
         {
             std::cerr << "Failed to allocate output pool buffer, index=" << i << std::endl;
             ReleaseOutputPool();
@@ -284,7 +289,7 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
     const size_t src_need = CalcNv12ImageSize(src_cfg.h_stride, src_cfg.v_stride);
     if (src->size < src_need)
     {
-        std::cerr << "RGA source buffer too small, size=" << src->size << ", need=" << src_need
+        std::cerr << "RGA source buffer too small, size=" << src->size << ", SizeNeed=" << src_need
                   << std::endl;
         return nullptr;
     }
@@ -345,7 +350,10 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
     return dst;
 }
 
-const IO_FD_t* RgaInstance::Copy(const IO_FD_t* src) { return TransformInternal(src, Operation::kCopy); }
+const IO_FD_t* RgaInstance::Copy(const IO_FD_t* src)
+{
+    return TransformInternal(src, Operation::kCopy);
+}
 
 const IO_FD_t* RgaInstance::FlipHorizontal(const IO_FD_t* src)
 {

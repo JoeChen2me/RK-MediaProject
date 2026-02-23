@@ -13,7 +13,7 @@
 
 namespace
 {
-constexpr MppPollType kPollTimeout500Ms = static_cast<MppPollType>(500);
+constexpr MppPollType kPollTimeout500Ms   = static_cast<MppPollType>(500);
 constexpr auto        kHolderWaitInterval = std::chrono::milliseconds(100);
 
 inline uint32_t Align16(uint32_t value) { return (value + 15u) & ~15u; }
@@ -79,9 +79,9 @@ void MppInstance::ReturnDecodedTaskHolder(DecodedTaskHolder* holder)
     {
         return;
     }
-    holder->output_desc   = nullptr;
-    holder->output_frame  = nullptr;
-    holder->output_buf    = nullptr;
+    holder->output_desc  = nullptr;
+    holder->output_frame = nullptr;
+    holder->output_buf   = nullptr;
 
     std::lock_guard<std::mutex> lock(HolderMutex);
     FreeHolderQueue.push_back(holder);
@@ -282,8 +282,9 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
         group = nullptr;
         return -1;
     }
-    ret = mpp_buffer_group_limit_config(group, OutSize,
-                                        resource_limits::kMppOutputBufferCount);  // 配置上限，实际缓冲通过 commit 注入
+    ret = mpp_buffer_group_limit_config(
+        group, OutSize,
+        resource_limits::kMppOutputBufferCount);  // 配置上限，实际缓冲通过 commit 注入
     if (ret != MPP_OK)
     {
         mpp_buffer_group_put(group);
@@ -330,7 +331,7 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
     const size_t import_limit   = (frame_desc_count < resource_limits::kMppImportBufferCount)
                                       ? frame_desc_count
                                       : resource_limits::kMppImportBufferCount;  // 避免越界访问
-    for (size_t i = 0; i < import_limit; ++i)               // 遍历
+    for (size_t i = 0; i < import_limit; ++i)                                    // 遍历
     {
         const FrameDesc& frame_desc = frame_desc_array[i];  // 引用当前帧描述，避免不必要的拷贝
         if (frame_desc.fd < 0 || frame_desc.Length == 0)
@@ -403,11 +404,11 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     // 先回收上一轮挂起的输出任务，确保 frame/buf 生命周期由业务控制（至少延后一轮）。
     DrainPendingRecycleQueue();
 
-    MPP_RET ret               = MPP_NOK;
-    int     outbuf_fd         = -1;
-    size_t  MappedBufferIndex = 0;
-    IO_FD_t*          output_desc   = nullptr;
-    DecodedTaskHolder* holder       = nullptr;
+    MPP_RET            ret               = MPP_NOK;
+    int                outbuf_fd         = -1;
+    size_t             MappedBufferIndex = 0;
+    IO_FD_t*           output_desc       = nullptr;
+    DecodedTaskHolder* holder            = nullptr;
 
     CurrentOutputDesc = nullptr;
 
@@ -424,7 +425,8 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     {
         return -1;
     }
-    if (buffer_index < 0 || static_cast<size_t>(buffer_index) >= resource_limits::kMppImportBufferCount)
+    if (buffer_index < 0 ||
+        static_cast<size_t>(buffer_index) >= resource_limits::kMppImportBufferCount)
     {
         std::cerr << "Invalid input buffer index for decode: " << buffer_index << std::endl;
         return -1;
@@ -462,8 +464,8 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
 
         if (!holder_wait_logged)
         {
-            std::cerr << "No free decoded holder available, wait "
-                      << kHolderWaitInterval.count() << "ms and retry" << std::endl;
+            std::cerr << "No free decoded holder available, wait " << kHolderWaitInterval.count()
+                      << "ms and retry" << std::endl;
             holder_wait_logged = true;
         }
 
@@ -528,7 +530,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     mpp_packet_set_data(packet_local,
                         const_cast<void*>(mapped_base));  // 设置数据指针为映射后的基地址
     mpp_packet_set_pos(packet_local,
-                       const_cast<void*>(mapped_base));   // 设置当前位置为映射后的基地址
+                       const_cast<void*>(mapped_base));  // 设置当前位置为映射后的基地址
     mpp_packet_set_length(packet_local, effective_size);  // 设置数据长度为有效载荷大小
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);
@@ -562,7 +564,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     }
     input_task_is_submitted = true;
     input_task              = nullptr;
-    packet_local            = nullptr;  // packet 已交给 input task，后续在回收该 task 时释放
+    packet_local = nullptr;  // packet 已交给 input task，后续在回收该 task 时释放
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_OUTPUT, kPollTimeout500Ms);
     if (ret < 0)
@@ -599,7 +601,8 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
             (OutSize > buf_size)
                 ? OutSize
                 : buf_size;  // 更新输出缓冲大小，取当前值和解码器要求的最大值，避免过小导致后续解码失败
-        ret = mpp_buffer_group_limit_config(group, OutSize, resource_limits::kMppOutputBufferCount);  // 更新缓冲上限配置
+        ret = mpp_buffer_group_limit_config(
+            group, OutSize, resource_limits::kMppOutputBufferCount);  // 更新缓冲上限配置
         if (ret != MPP_OK)
         {
             goto fail;
@@ -658,7 +661,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
             goto fail;
         }
 
-        IO_FD_t& output_info = MppOutputFDList[MappedBufferIndex];
+        IO_FD_t& output_info   = MppOutputFDList[MappedBufferIndex];
         output_info.width      = static_cast<uint32_t>(frame_width);
         output_info.height     = static_cast<uint32_t>(frame_height);
         output_info.hor_stride = static_cast<uint32_t>(frame_hs);
@@ -710,9 +713,9 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         OutDesc2HolderMap[output_desc] = holder;
     }
 
-    out_frm_local  = nullptr;
-    out_buf_local  = nullptr;
-    holder         = nullptr;
+    out_frm_local = nullptr;
+    out_buf_local = nullptr;
+    holder        = nullptr;
     return 0;
 
 fail:
@@ -900,7 +903,7 @@ int MppInstance::CommitExternalOutputBuffers(size_t size)
             return -1;
         }
         OutBufFD2Index_Map[output.fd] =
-            i;                  // 记录成功提交的输出缓冲 fd 与索引映射，便于后续按 fd 反查索引
+            i;  // 记录成功提交的输出缓冲 fd 与索引映射，便于后续按 fd 反查索引
         commit.fd = output.fd;  // 提交外部 dma-buf fd 给 MPP 在 group 生命周期内使用
         commit.ptr =
             nullptr;  // MPP_BUFFER_TYPE_EXT_DMA 模式下 ptr 不需要设置，确保为 nullptr 以免误用

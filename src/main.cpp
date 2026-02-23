@@ -1,21 +1,18 @@
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
-#include <cstring>
 #include <deque>
 #include <iostream>
 #include <mutex>
-#include <semaphore.h>
 #include <thread>
 
 #include "rkmpp.h"
 #include "rkrga.h"
 #include "v4l2Camera.h"
 
-const std::string            device      = "/dev/video0";
-static volatile sig_atomic_t should_exit = 0;  // 用于控制程序退出的标志
+const std::string            device      = "/dev/video0";  // USB 摄像头路径
+static volatile sig_atomic_t should_exit = 0;              // 用于控制程序退出的标志
 
 static void signal_handler(int signum)
 {
@@ -69,31 +66,26 @@ int main()
         return 1;
     }
 
-    std::mutex              ready_mutex;
-    std::mutex              recycle_mutex;
-    std::mutex              rga_consume_mutex;
-    std::mutex              mpp_recycle_output_mutex;
-    std::condition_variable ready_cv;
-    std::deque<FrameDesc*>  readyQueue;
-    std::deque<FrameDesc*>  recycleQueue;
+    std::mutex                 ready_mutex;
+    std::mutex                 recycle_mutex;
+    std::mutex                 rga_consume_mutex;
+    std::mutex                 mpp_recycle_output_mutex;
+    std::condition_variable    ready_cv;
+    std::condition_variable    rga_consume_cv;
+    std::deque<FrameDesc*>     readyQueue;
+    std::deque<FrameDesc*>     recycleQueue;
     std::deque<const IO_FD_t*> rgaConsumeQueue;
     std::deque<const IO_FD_t*> mppRecycleOutputQueue;
-    std::atomic_bool        stop_requested{false};
-    std::atomic_bool        fatal_error{false};
-    size_t                  dropped_frames      = 0;
-    constexpr size_t        kMaxReadyQueueDepth = 2;  // 控制端到端延迟，超限时丢弃最旧帧
-    sem_t                   rga_consume_sem{};
-    if (sem_init(&rga_consume_sem, 0, 0) != 0)
-    {
-        std::cerr << "Failed to initialize RGA semaphore: " << std::strerror(errno) << std::endl;
-        return 1;
-    }
+    std::atomic_bool           stop_requested{false};
+    std::atomic_bool           fatal_error{false};
+    size_t                     dropped_frames = 0;
+    constexpr size_t kMaxReadyQueueDepth = 3;  // 控制端到端延迟，超限时丢弃最旧帧
 
     auto request_stop = [&]()
     {
         stop_requested.store(true);
         ready_cv.notify_all();
-        (void)sem_post(&rga_consume_sem);  // 唤醒可能阻塞在等待队列的 RGA 线程
+        rga_consume_cv.notify_all();
     };
 
     auto drain_mpp_recycle_requests = [&]()
@@ -265,11 +257,13 @@ int main()
                 else
                 {
                     const IO_FD_t* decoded_output = mpp_instance.CurrentOutputDesc;
-                    if (!decoded_output || decoded_output->width == 0 || decoded_output->height == 0 ||
-                        decoded_output->hor_stride == 0 || decoded_output->ver_stride == 0)
+                    if (!decoded_output || decoded_output->width == 0 ||
+                        decoded_output->height == 0 || decoded_output->hor_stride == 0 ||
+                        decoded_output->ver_stride == 0)
                     {
                         std::cerr << "Decoded output metadata is invalid" << std::endl;
-                        if (decoded_output && mpp_instance.MppQueueOutputForRecycle(decoded_output) != 0)
+                        if (decoded_output &&
+                            mpp_instance.MppQueueOutputForRecycle(decoded_output) != 0)
                         {
                             std::cerr << "Failed to recycle invalid decoded output, fd="
                                       << decoded_output->fd << std::endl;
@@ -281,10 +275,10 @@ int main()
                             std::lock_guard<std::mutex> lock(rga_consume_mutex);
                             rgaConsumeQueue.push_back(decoded_output);
                         }
-                        (void)sem_post(&rga_consume_sem);
+                        rga_consume_cv.notify_one();
                     }
-                    std::cout << "Frame captured and decoded successfully, length: "
-                              << frame_desc->payloadSize << " bytes" << std::endl;
+                    // std::cout << "Frame captured and decoded successfully, length: "
+                    //   << frame_desc->payloadSize << " bytes" << std::endl;
                 }
 
                 {
@@ -299,50 +293,44 @@ int main()
         {
             while (true)
             {
-                while (sem_wait(&rga_consume_sem) != 0)
-                {
-                    if (errno != EINTR)
-                    {
-                        std::cerr << "RGA semaphore wait failed: " << std::strerror(errno)
-                                  << std::endl;
-                        fatal_error.store(true);
-                        request_stop();
-                        return;
-                    }
-                }
-
                 const IO_FD_t* input_desc = nullptr;
                 {
-                    std::lock_guard<std::mutex> lock(rga_consume_mutex);
-                    if (!rgaConsumeQueue.empty())
+                    std::unique_lock<std::mutex> lock(rga_consume_mutex);  // 获取锁
+                    rga_consume_cv.wait(
+                        lock, [&]() { return !rgaConsumeQueue.empty() || stop_requested.load(); });
+                    if (rgaConsumeQueue.empty())
                     {
-                        input_desc = rgaConsumeQueue.front();
-                        rgaConsumeQueue.pop_front();
+                        if (stop_requested.load())
+                        {
+                            break;
+                        }
+                        continue;
                     }
+                    input_desc = rgaConsumeQueue.front();  // 有数据了，取出队首元素
+                    rgaConsumeQueue.pop_front();           // 从队列中移除已取出的元素
                 }
 
                 if (!input_desc)
                 {
-                    if (stop_requested.load())
-                    {
-                        break;
-                    }
                     continue;
                 }
 
-                if (!rga_instance.Copy(input_desc))
+                if (!rga_instance.FlipHorizontal(input_desc))  // 以水平翻转为例进行 RGA 处理
                 {
                     std::cerr << "RGA processing failed, fd=" << input_desc->fd << std::endl;
                 }
 
                 {
-                    std::lock_guard<std::mutex> lock(mpp_recycle_output_mutex);
-                    mppRecycleOutputQueue.push_back(input_desc);
+                    std::lock_guard<std::mutex> lock(mpp_recycle_output_mutex);  // 获取锁
+                    mppRecycleOutputQueue.push_back(
+                        input_desc);  // 将处理完成的输出描述加入回收队列
                 }
+                std::cout << "Frame processed by RGA and queued for recycle, fd=" << input_desc->fd
+                          << std::endl;
             }
         });
 
-    while (!stop_requested.load())
+    while (!stop_requested.load())  // 主线程等待退出信号的触发
     {
         if (should_exit)
         {
@@ -351,7 +339,7 @@ int main()
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-
+    // 请求所有线程停止，并等待它们退出
     if (capture_thread.joinable())
     {
         capture_thread.join();
@@ -361,12 +349,12 @@ int main()
     {
         decode_thread.join();
     }
-    (void)sem_post(&rga_consume_sem);  // decode 已退出后唤醒 rga 线程做最终退出判断
+    rga_consume_cv.notify_all();
     if (rga_thread.joinable())
     {
         rga_thread.join();
     }
-    drain_mpp_recycle_requests();
+    drain_mpp_recycle_requests();  // 确保所有待回收的输出都被处理掉，避免资源泄漏
 
     // 退出阶段不再执行回队，交由 V4L2 反初始化流程（STREAMOFF + REQBUFS(0)）统一释放。
     {
@@ -385,8 +373,6 @@ int main()
         std::lock_guard<std::mutex> lock(mpp_recycle_output_mutex);
         mppRecycleOutputQueue.clear();
     }
-
-    (void)sem_destroy(&rga_consume_sem);
 
     // 依赖析构函数完成资源的回收
     if (dropped_frames > 0)

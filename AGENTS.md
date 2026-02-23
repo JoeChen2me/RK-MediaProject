@@ -37,3 +37,8 @@
 
 - 控制命令定义（control cmd 对照）：
   - `/home/joe/Code/V4L2-Develop/Basic_WthoutAI/experiments/mpp_src_try/mpp/inc/rk_mpi_cmd.h`
+
+
+## Git 提交规范
+
+- 暂存更改之前，对修改的文件进行 clang-format 格式化，确保代码风格一致，使用`./.clang-format`文件中的规范。

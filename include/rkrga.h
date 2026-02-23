@@ -17,7 +17,7 @@ class RgaInstance
     RgaInstance();
     ~RgaInstance();
 
-    int RgaInit();
+    int            RgaInit();
     const IO_FD_t* Copy(const IO_FD_t* src);
     const IO_FD_t* FlipHorizontal(const IO_FD_t* src);
     const IO_FD_t* FlipVertical(const IO_FD_t* src);
@@ -25,9 +25,11 @@ class RgaInstance
    private:
     struct ImageConfig
     {
-        uint32_t width    = 0;
-        uint32_t height   = 0;
+        uint32_t width  = 0;
+        uint32_t height = 0;
+        // 历史命名：h_stride 对应水平方向步幅（wstride，来自 IO_FD_t::hor_stride）。
         uint32_t h_stride = 0;
+        // 历史命名：v_stride 对应垂直方向步幅（hstride，来自 IO_FD_t::ver_stride）。
         uint32_t v_stride = 0;
         bool     valid    = false;
     };
@@ -48,10 +50,10 @@ class RgaInstance
     IO_FD_t*       AcquireOutputPoolBuffer();
     const IO_FD_t* TransformInternal(const IO_FD_t* src, Operation op);
     size_t         CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) const;
-    bool                    initialized_                   = false;
-    IO_FD_t                 output_pool_[resource_limits::kRgaOutputBufferCount] = {};
-    bool                    output_pool_ready_             = false;
-    size_t                  output_pool_index_             = 0;
+    bool           initialized_                                         = false;
+    IO_FD_t        output_pool_[resource_limits::kRgaOutputBufferCount] = {};
+    bool           output_pool_ready_                                   = false;
+    size_t         output_pool_index_                                   = 0;
 };
 
 #endif  // RK_RGA_H
