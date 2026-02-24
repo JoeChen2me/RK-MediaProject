@@ -1,4 +1,6 @@
-#include "rkmpp.h"
+#include "rkmppdec.h"
+#include "mpp_common_utils.h"
+
 #include <fcntl.h>  // open, O_RDWR, O_CLOEXEC
 #include <linux/dma-heap.h>
 #include <sys/mman.h>
@@ -15,28 +17,9 @@ namespace
 {
 constexpr MppPollType kPollTimeout500Ms   = static_cast<MppPollType>(500);
 constexpr auto        kHolderWaitInterval = std::chrono::milliseconds(100);
-
-inline uint32_t Align16(uint32_t value) { return (value + 15u) & ~15u; }
-
-// 从帧尾部回扫 EOI(FFD9)，裁掉 V4L2 可能附带的对齐填充。
-size_t FindJpegEffectiveSize(const uint8_t* data, size_t len)
-{
-    if (!data || len < 4)
-    {
-        return 0;
-    }
-    for (size_t i = len; i >= 2; --i)
-    {
-        if (data[i - 2] == 0xFF && data[i - 1] == 0xD9)
-        {
-            return i;
-        }
-    }
-    return 0;
-}
 }  // namespace
 
-MppInstance::MppInstance()
+MppDecInstance::MppDecInstance()
 {
     for (auto& fd_info : MppOutputFDList)
     {
@@ -61,7 +44,7 @@ MppInstance::MppInstance()
     OutDesc2HolderMap.clear();
 }
 
-MppInstance::DecodedTaskHolder* MppInstance::AcquireDecodedTaskHolder()
+MppDecInstance::DecodedTaskHolder* MppDecInstance::AcquireDecodedTaskHolder()
 {
     std::lock_guard<std::mutex> lock(HolderMutex);
     if (FreeHolderQueue.empty())
@@ -73,7 +56,7 @@ MppInstance::DecodedTaskHolder* MppInstance::AcquireDecodedTaskHolder()
     return holder;
 }
 
-void MppInstance::ReturnDecodedTaskHolder(DecodedTaskHolder* holder)
+void MppDecInstance::ReturnDecodedTaskHolder(DecodedTaskHolder* holder)
 {
     if (!holder)
     {
@@ -87,7 +70,7 @@ void MppInstance::ReturnDecodedTaskHolder(DecodedTaskHolder* holder)
     FreeHolderQueue.push_back(holder);
 }
 
-void MppInstance::ReleaseTaskPacket(MppTask task)
+void MppDecInstance::ReleaseTaskPacket(MppTask task)
 {
     if (!task)
     {
@@ -102,7 +85,7 @@ void MppInstance::ReleaseTaskPacket(MppTask task)
     }
 }
 
-void MppInstance::RecycleDecodedTaskHolder(DecodedTaskHolder* holder)
+void MppDecInstance::RecycleDecodedTaskHolder(DecodedTaskHolder* holder)
 {
     if (!holder)
     {
@@ -122,7 +105,7 @@ void MppInstance::RecycleDecodedTaskHolder(DecodedTaskHolder* holder)
     ReturnDecodedTaskHolder(holder);
 }
 
-void MppInstance::DrainPendingRecycleQueue()
+void MppDecInstance::DrainPendingRecycleQueue()
 {
     std::deque<DecodedTaskHolder*> local_queue;
     {
@@ -137,7 +120,7 @@ void MppInstance::DrainPendingRecycleQueue()
     }
 }
 
-void MppInstance::ForceRecycleAllHolders()
+void MppDecInstance::ForceRecycleAllHolders()
 {
     std::deque<DecodedTaskHolder*> local_queue;
     {
@@ -161,7 +144,7 @@ void MppInstance::ForceRecycleAllHolders()
     }
 }
 
-int MppInstance::MppQueueOutputForRecycle(const IO_FD_t* output_desc)
+int MppDecInstance::DecQueueOutputForRecycle(const IO_FD_t* output_desc)
 {
     if (!output_desc)
     {
@@ -182,7 +165,7 @@ int MppInstance::MppQueueOutputForRecycle(const IO_FD_t* output_desc)
     return 0;
 }
 
-int MppInstance::MppInit()
+int MppDecInstance::DecInit()
 {
     if (mpp_ctx && mpp_api)
     {
@@ -259,7 +242,7 @@ fail:
     return -1;
 }
 
-int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_desc_count)
+int MppDecInstance::DecAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_desc_count)
 {
     if (!mpp_ctx || !mpp_api)
     {
@@ -273,7 +256,7 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
     {
         return 0;
     }
-    // 这个函数需要在MppConfigWidthHeight之后进行调用
+    // 这个函数需要在 DecConfigWidthHeight 之后进行调用。
 
     MPP_RET ret =
         mpp_buffer_group_get_external(&group, MPP_BUFFER_TYPE_EXT_DMA);  // 模式三：外部缓冲组
@@ -382,7 +365,7 @@ int MppInstance::MppAllocBuffer(const FrameDesc* frame_desc_array, size_t frame_
     return 0;
 }
 
-int MppInstance::MppConfigWidthHeight(uint32_t width, uint32_t height)
+int MppDecInstance::DecConfigWidthHeight(uint32_t width, uint32_t height)
 {
     if (width == 0 || height == 0)
     {
@@ -391,15 +374,15 @@ int MppInstance::MppConfigWidthHeight(uint32_t width, uint32_t height)
 
     ImgWidth  = width;
     ImgHeight = height;
-    H_Stride  = Align16(ImgWidth);
-    V_Stride  = Align16(ImgHeight);
+    H_Stride  = mpp_common::Align16(ImgWidth);
+    V_Stride  = mpp_common::Align16(ImgHeight);
 
     // 兼容 JPEG 解码常见的附加信息/对齐需求，按 2 bytes/pixel 预留更稳妥。
     OutSize = static_cast<size_t>(H_Stride) * static_cast<size_t>(V_Stride) * 2u;
     return 0;
 }
 
-int MppInstance::MppDecode(const FrameDesc* frame_desc)
+int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
 {
     // 先回收上一轮挂起的输出任务，确保 frame/buf 生命周期由业务控制（至少延后一轮）。
     DrainPendingRecycleQueue();
@@ -445,9 +428,9 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
         return -1;
     }
 
-    const auto*  input_data = static_cast<const uint8_t*>(mapped_base);  // 方便后续字节操作
-    const size_t effective_size =
-        FindJpegEffectiveSize(input_data, payload_size);  // 计算有效载荷大小，裁掉可能的对齐填充
+    const auto*  input_data     = static_cast<const uint8_t*>(mapped_base);  // 方便后续字节操作
+    const size_t effective_size = mpp_common::FindJpegEffectiveSize(
+        input_data, payload_size);  // 计算有效载荷大小，裁掉可能的对齐填充
     if (effective_size == 0 || effective_size > mpp_buffer_get_size(input_buffer))
     {
         return -1;
@@ -530,7 +513,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     mpp_packet_set_data(packet_local,
                         const_cast<void*>(mapped_base));  // 设置数据指针为映射后的基地址
     mpp_packet_set_pos(packet_local,
-                       const_cast<void*>(mapped_base));  // 设置当前位置为映射后的基地址
+                       const_cast<void*>(mapped_base));   // 设置当前位置为映射后的基地址
     mpp_packet_set_length(packet_local, effective_size);  // 设置数据长度为有效载荷大小
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);
@@ -564,7 +547,7 @@ int MppInstance::MppDecode(const FrameDesc* frame_desc)
     }
     input_task_is_submitted = true;
     input_task              = nullptr;
-    packet_local = nullptr;  // packet 已交给 input task，后续在回收该 task 时释放
+    packet_local            = nullptr;  // packet 已交给 input task，后续在回收该 task 时释放
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_OUTPUT, kPollTimeout500Ms);
     if (ret < 0)
@@ -750,7 +733,7 @@ fail:
     return -1;
 }
 
-MppInstance::~MppInstance()
+MppDecInstance::~MppDecInstance()
 {
     ForceRecycleAllHolders();
     DrainPendingRecycleQueue();
@@ -779,14 +762,14 @@ MppInstance::~MppInstance()
     }
 }
 
-int MppInstance::AllocDmaBufFD(IO_FD_t& output, size_t size)
+int MppDecInstance::AllocDmaBufFD(IO_FD_t& output, size_t size)
 {
     if (size == 0)
     {
         std::cerr << "Invalid size for DMA buffer allocation: " << size << std::endl;
         return -1;
     }
-    int heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+    int heap = open(mpp_common::kSystemDmaHeapPath, O_RDWR | O_CLOEXEC);
     if (heap < 0)
     {
         perror("Failed to open dma_heap");
@@ -826,7 +809,7 @@ int MppInstance::AllocDmaBufFD(IO_FD_t& output, size_t size)
     return 0;
 }
 
-void MppInstance::ReleaseExternalOutputBuffers()
+void MppDecInstance::ReleaseExternalOutputBuffers()
 {
     // 外部输出缓冲重建或析构前，先把挂起的输出 task/frame/buf 全部归还。
     ForceRecycleAllHolders();
@@ -862,7 +845,7 @@ void MppInstance::ReleaseExternalOutputBuffers()
     CurrentOutputDesc = nullptr;
 }
 
-int MppInstance::CommitExternalOutputBuffers(size_t size)
+int MppDecInstance::CommitExternalOutputBuffers(size_t size)
 {
     if (!group || size == 0)
     {
@@ -903,7 +886,7 @@ int MppInstance::CommitExternalOutputBuffers(size_t size)
             return -1;
         }
         OutBufFD2Index_Map[output.fd] =
-            i;  // 记录成功提交的输出缓冲 fd 与索引映射，便于后续按 fd 反查索引
+            i;                  // 记录成功提交的输出缓冲 fd 与索引映射，便于后续按 fd 反查索引
         commit.fd = output.fd;  // 提交外部 dma-buf fd 给 MPP 在 group 生命周期内使用
         commit.ptr =
             nullptr;  // MPP_BUFFER_TYPE_EXT_DMA 模式下 ptr 不需要设置，确保为 nullptr 以免误用

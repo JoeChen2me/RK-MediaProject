@@ -7,7 +7,7 @@
 #include <mutex>
 #include <thread>
 
-#include "rkmpp.h"
+#include "rkmppdec.h"
 #include "rkrga.h"
 #include "v4l2Camera.h"
 
@@ -40,20 +40,20 @@ int main()
         return 1;
     }
 
-    MppInstance mpp_instance;
-    if (mpp_instance.MppInit() != 0)  // 初始化 MPP 实例
+    MppDecInstance mpp_decoder_instance;
+    if (mpp_decoder_instance.DecInit() != 0)  // 初始化 MPP 实例
     {
         std::cerr << "Failed to initialize MPP instance" << std::endl;
         return 1;
     }
-    if (mpp_instance.MppConfigWidthHeight(active_cfg.width, active_cfg.height) !=
+    if (mpp_decoder_instance.DecConfigWidthHeight(active_cfg.width, active_cfg.height) !=
         0)  // 配置 MPP 的宽高参数
     {
         std::cerr << "Failed to configure MPP width and height" << std::endl;
         return 1;
     }
-    if (mpp_instance.MppAllocBuffer(camera.FrameDescArray,
-                                    static_cast<size_t>(camera.get_buffer_count())) != 0)
+    if (mpp_decoder_instance.DecAllocBuffer(camera.FrameDescArray,
+                                            static_cast<size_t>(camera.get_buffer_count())) != 0)
     {
         std::cerr << "Failed to import V4L2 dma-buf into MPP input buffers" << std::endl;
         return 1;
@@ -78,8 +78,8 @@ int main()
     std::deque<const IO_FD_t*> mppRecycleOutputQueue;
     std::atomic_bool           stop_requested{false};
     std::atomic_bool           fatal_error{false};
-    size_t                     dropped_frames = 0;
-    constexpr size_t kMaxReadyQueueDepth = 3;  // 控制端到端延迟，超限时丢弃最旧帧
+    size_t                     dropped_frames      = 0;
+    constexpr size_t           kMaxReadyQueueDepth = 3;  // 控制端到端延迟，超限时丢弃最旧帧
 
     auto request_stop = [&]()
     {
@@ -102,7 +102,7 @@ int main()
 
         for (const IO_FD_t* output_desc : pending_outputs)
         {
-            if (mpp_instance.MppQueueOutputForRecycle(output_desc) != 0)
+            if (mpp_decoder_instance.DecQueueOutputForRecycle(output_desc) != 0)
             {
                 std::cerr << "Failed to queue decoded output for recycle, fd="
                           << ((output_desc) ? output_desc->fd : -1) << std::endl;
@@ -248,7 +248,7 @@ int main()
                     continue;
                 }
 
-                if (mpp_instance.MppDecode(frame_desc) != 0)
+                if (mpp_decoder_instance.MppDecode(frame_desc) != 0)
                 {
                     // 解码失败直接跳过该帧，仅提交回收队列，保证采集链路继续前进。
                     std::cerr << "Failed to decode frame, index=" << frame_desc->index
@@ -256,14 +256,14 @@ int main()
                 }
                 else
                 {
-                    const IO_FD_t* decoded_output = mpp_instance.CurrentOutputDesc;
+                    const IO_FD_t* decoded_output = mpp_decoder_instance.CurrentOutputDesc;
                     if (!decoded_output || decoded_output->width == 0 ||
                         decoded_output->height == 0 || decoded_output->hor_stride == 0 ||
                         decoded_output->ver_stride == 0)
                     {
                         std::cerr << "Decoded output metadata is invalid" << std::endl;
                         if (decoded_output &&
-                            mpp_instance.MppQueueOutputForRecycle(decoded_output) != 0)
+                            mpp_decoder_instance.DecQueueOutputForRecycle(decoded_output) != 0)
                         {
                             std::cerr << "Failed to recycle invalid decoded output, fd="
                                       << decoded_output->fd << std::endl;

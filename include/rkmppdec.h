@@ -1,5 +1,5 @@
-#ifndef RKMPP_H
-#define RKMPP_H
+#ifndef RKMPPDEC_H
+#define RKMPPDEC_H
 
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_frame.h>
@@ -16,17 +16,17 @@
 #include <mutex>
 #include <vector>
 
-class MppInstance
+class MppDecInstance
 {
    public:
-    MppInstance();
-    ~MppInstance();
+    MppDecInstance();
+    ~MppDecInstance();
 
-    int MppInit();
-    int MppAllocBuffer(const FrameDesc* frame_desc_array, size_t buffer_count);
-    int MppConfigWidthHeight(uint32_t width, uint32_t height);
+    int DecInit();
+    int DecAllocBuffer(const FrameDesc* frame_desc_array, size_t buffer_count);
+    int DecConfigWidthHeight(uint32_t width, uint32_t height);
     int MppDecode(const FrameDesc* frame_desc);
-    int MppQueueOutputForRecycle(const IO_FD_t* output_desc);
+    int DecQueueOutputForRecycle(const IO_FD_t* output_desc);
 
     MppBuffer MppBuffers[resource_limits::kMppImportBufferCount] = {
         nullptr};                                // 存储导入的输入缓冲句柄
@@ -40,9 +40,9 @@ class MppInstance
         MppBuffer output_buf   = nullptr;
     };
 
-    int AllocDmaBufFD(IO_FD_t& output, size_t size);  // 分配并映射一个 dma-buf
-    int CommitExternalOutputBuffers(size_t size);  // 按指定大小提交外部输出缓冲到 group
-    void               ReleaseExternalOutputBuffers();  // 释放外部输出缓冲 fd
+    int  AllocDmaBufFD(IO_FD_t& output, size_t size);  // 分配并映射一个 dma-buf
+    int  CommitExternalOutputBuffers(size_t size);     // 按指定大小提交外部输出缓冲到 group
+    void ReleaseExternalOutputBuffers();               // 释放外部输出缓冲 fd
     DecodedTaskHolder* AcquireDecodedTaskHolder();
     void               ReturnDecodedTaskHolder(DecodedTaskHolder* holder);
     void               ReleaseTaskPacket(MppTask task);
@@ -59,7 +59,7 @@ class MppInstance
     uint32_t       V_Stride  = 0;        // 列对齐
     size_t         OutSize   = 0;        // 单帧输出缓冲大小
     IO_FD_t        MppOutputFDList[resource_limits::kMppOutputBufferCount] =
-        {};  // 存储输出缓冲的详细信息,包含完整信息
+        {};                                    // 存储输出缓冲的详细信息,包含完整信息
     std::map<int, size_t> OutBufFD2Index_Map;  // 记录输出 dma-buf fd 到缓冲索引的映射关系
     std::array<DecodedTaskHolder, resource_limits::kMppOutputBufferCount> HolderPool =
         {};  // 固定资源池，避免频繁 new/delete
@@ -69,4 +69,4 @@ class MppInstance
     std::mutex                                   HolderMutex;
 };
 
-#endif  // RKMPP_H
+#endif  // RKMPPDEC_H

@@ -268,8 +268,7 @@ int V4L2_Camera::check_cameraCapabilities()
     }
     // 二次确认：S_FMT 后立即 G_FMT，读取驱动最终生效配置。
     {
-        struct v4l2_format fmt_get
-        {};
+        struct v4l2_format fmt_get{};
         fmt_get.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (ioctl(camera_fd, VIDIOC_G_FMT, &fmt_get) < 0)
         {
@@ -334,8 +333,7 @@ int V4L2_Camera::check_cameraCapabilities()
     }
     // 二次确认：S_PARM 后立即 G_PARM，读取驱动最终生效帧率。
     {
-        struct v4l2_streamparm parm_get
-        {};
+        struct v4l2_streamparm parm_get{};
         parm_get.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (ioctl(camera_fd, VIDIOC_G_PARM, &parm_get) < 0)
         {
@@ -568,8 +566,7 @@ int V4L2_Camera::init_camera_buffer()
     }
 
     // 请求缓冲区
-    struct v4l2_requestbuffers reqbuf
-    {};
+    struct v4l2_requestbuffers reqbuf{};
     reqbuf.count  = camera_params::kRequestBufferCount;  // 请求缓冲区数量
     reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;         // 视频捕获类型
     reqbuf.memory = V4L2_MEMORY_MMAP;                    // 使用内存映射方式
@@ -593,8 +590,7 @@ int V4L2_Camera::init_camera_buffer()
     // 按驱动返回的 count 有界遍历，避免把异常当成正常结束
     for (__u32 i = 0; i < reqbuf.count; ++i)
     {
-        struct v4l2_buffer buffer
-        {};
+        struct v4l2_buffer buffer{};
         buffer.index  = i;
         buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buffer.memory = V4L2_MEMORY_MMAP;
@@ -615,8 +611,7 @@ int V4L2_Camera::init_camera_buffer()
             deinit_camera_buffer();
             return -1;
         }
-        struct v4l2_exportbuffer expbuf
-        {};
+        struct v4l2_exportbuffer expbuf{};
         expbuf.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;        // 视频捕获类型
         expbuf.index = i;                                  // 指定要导出的缓冲区索引
         if (ioctl(camera_fd, VIDIOC_EXPBUF, &expbuf) < 0)  // 导出缓冲区以获取文件描述符
@@ -638,8 +633,7 @@ int V4L2_Camera::init_camera_buffer()
     // 将所有缓冲区入队，准备开始捕获
     for (int i = 0; i < this->NumBuffers; i++)
     {
-        struct v4l2_buffer buffer
-        {};
+        struct v4l2_buffer buffer{};
         buffer.index  = static_cast<__u32>(i);
         buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buffer.memory = V4L2_MEMORY_MMAP;
@@ -693,8 +687,7 @@ int V4L2_Camera::deinit_camera_buffer()
         FrameDescArray[i].index = -1;
     }
 
-    struct v4l2_requestbuffers reqbuf
-    {};
+    struct v4l2_requestbuffers reqbuf{};
     reqbuf.count  = 0;  // 释放驱动侧分配的全部缓冲区
     reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     reqbuf.memory = V4L2_MEMORY_MMAP;
@@ -808,8 +801,7 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
     bufferSize = 0;
 
     // 使用 poll 来实现非阻塞等待，避免直接调用 DQBUF 可能导致的长时间阻塞
-    struct pollfd pfd
-    {};
+    struct pollfd pfd{};
     pfd.fd             = camera_fd;
     pfd.events         = POLLIN | POLLPRI;  // 等待可读事件
     const int poll_ret = poll(&pfd, 1, camera_params::kDequeueTimeoutMs);
@@ -845,8 +837,7 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
      * 在确认有可读事件后，安全地调用 DQBUF 来获取帧数据。即使在极少数情况下 poll 可能误报，但 DQBUF
      * 的错误处理也足够健壮，可以通过 errno 判断是否需要重试或处理错误。
      */
-    struct v4l2_buffer buffer
-    {};
+    struct v4l2_buffer buffer{};
     buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;      // 视频捕获类型
     buffer.memory = V4L2_MEMORY_MMAP;                 // 使用内存映射
     if (ioctl(camera_fd, VIDIOC_DQBUF, &buffer) < 0)  // 从内核队列中取出一帧数据
@@ -895,8 +886,7 @@ int V4L2_Camera::requeue_buffer(FrameDesc* frame_desc)
     }
     const auto buf_idx = static_cast<unsigned int>(idx);
 
-    struct v4l2_buffer buffer
-    {};
+    struct v4l2_buffer buffer{};
     buffer.index  = buf_idx;
     buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;     // 视频捕获类型
     buffer.memory = V4L2_MEMORY_MMAP;                // 使用内存映射

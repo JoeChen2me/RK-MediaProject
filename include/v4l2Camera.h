@@ -36,24 +36,24 @@ class V4L2_Camera
     // int Camera_Init(const char* device);
     int camera_GlobalInit(
         const std::string& device,
-        const int          exposureMs = 0);  // 包含打开设备、检查能力、初始化缓冲区等步骤的全局初始化函数
+        const int exposureMs = 0);  // 包含打开设备、检查能力、初始化缓冲区等步骤的全局初始化函数
     int open_camera(const char* device);         // 打开摄像头
     int open_camera(const std::string& device);  // 重载函数，接受 std::string 参数
     int check_cameraCapabilities();  // 检查摄像头的功能支持并设置输出格式、分辨率、帧率等参数
-    int init_camera_buffer();                 // 初始化摄像头缓冲区
-    int deinit_camera_buffer();               // 反初始化摄像头缓冲区 用于解除映射
+    int init_camera_buffer();        // 初始化摄像头缓冲区
+    int deinit_camera_buffer();      // 反初始化摄像头缓冲区 用于解除映射
     int capture_stream_switch(bool enabled);  // 流式捕获开关
     int camera_read_frame(size_t* out_length,
-                          size_t max_buffer_size = camera_params::kMaxFrameSize);  // 读取一帧数据
+                          size_t  max_buffer_size = camera_params::kMaxFrameSize);  // 读取一帧数据
     int dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
                        const size_t maxBufferSize);  // 从内核中取出一个缓冲区进行读取
-    int requeue_buffer(FrameDesc* frame_desc);  // 将一个缓冲区重新放回内核中以供后续使用
+    int requeue_buffer(FrameDesc* frame_desc);       // 将一个缓冲区重新放回内核中以供后续使用
 
-    int set_exposure_time(int exposure_time_ms);
+    int       set_exposure_time(int exposure_time_ms);
     FrameDesc FrameDescArray[camera_params::kMaxMappedBuffers];  // 保存每个缓冲区的统一描述信息
-    int                       get_buffer_count() const { return NumBuffers; }
+    int       get_buffer_count() const { return NumBuffers; }
     const VideoCaptureConfig& get_active_config() const { return ActiveConfig; }
-    FrameDesc* CurrentFrameDesc = nullptr;  // 当前出队并等待处理的帧描述
+    FrameDesc*                CurrentFrameDesc = nullptr;  // 当前出队并等待处理的帧描述
 
    private:
     int close_camera();  // 仅供析构函数调用，外部不可见
