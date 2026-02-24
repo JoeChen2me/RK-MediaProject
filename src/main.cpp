@@ -315,7 +315,9 @@ int main()
                     continue;
                 }
 
-                if (!rga_instance.FlipHorizontal(input_desc))  // 以水平翻转为例进行 RGA 处理
+                const IO_FD_t* rga_output =
+                    rga_instance.FlipHorizontal(input_desc);  // 以水平翻转为例进行 RGA 处理
+                if (rga_output == nullptr)
                 {
                     std::cerr << "RGA processing failed, fd=" << input_desc->fd << std::endl;
                 }
