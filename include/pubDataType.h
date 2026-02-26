@@ -6,8 +6,8 @@
 
 namespace resource_limits
 {
-// 全局资源池上限，按未来 H.264/H.265 参考帧场景预留。
-inline constexpr size_t kMaxAllocaSize = 35U;
+// 全局资源池上限，适度增大以降低多线程流水线下的 holder/池资源紧张概率。
+inline constexpr size_t kMaxAllocaSize = 48U;
 
 // 相机、MPP、RGA 的资源规模统一在此集中配置。
 inline constexpr size_t kCameraRequestBufferCount = 4U;

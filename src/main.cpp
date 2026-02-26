@@ -87,6 +87,7 @@ int main()
     std::mutex              rga_pool_mutex;  // 保护 RGA 输出池回收与分配路径
     std::condition_variable ready_cv;  // 用于通知解码线程有新帧可处理的条件变量
     std::condition_variable rga_consume_cv;  // 用于通知 RGA 线程有新帧可处理的条件变量
+    std::condition_variable mpp_recycle_output_cv;  // 用于通知解码输出可回收线程有新数据
     std::condition_variable mpp_encode_input_cv;  // 用于通知编码输入线程有新帧可处理
     std::deque<FrameDesc*>  readyQueue;  // 存储已捕获但未解码的帧描述指针的队列
     std::deque<FrameDesc*> recycleQueue;  /// 存储已处理完毕、等待回收的帧描述指针的队列
@@ -107,6 +108,7 @@ int main()
         stop_requested.store(true);
         ready_cv.notify_all();
         rga_consume_cv.notify_all();
+        mpp_recycle_output_cv.notify_all();
         mpp_encode_input_cv.notify_all();
     };
 
@@ -243,8 +245,6 @@ int main()
         {
             while (true)
             {
-                drain_mpp_recycle_requests();
-
                 FrameDesc* frame_desc = nullptr;
                 {
                     std::unique_lock<std::mutex> lock(ready_mutex);
@@ -272,7 +272,7 @@ int main()
 
                 if (mpp_decoder_instance.MppDecode(frame_desc) != 0)
                 {
-                    // 解码失败直接跳过该帧，仅提交回收队列，保证采集链路继续前进。
+                    // 解码失败直接跳过该帧，随后由 recycleQueue 回收到相机，保证采集链路继续前进。
                     std::cerr << "Failed to decode frame, index=" << frame_desc->index
                               << ", payload=" << frame_desc->payloadSize << std::endl;
                 }
@@ -299,13 +299,44 @@ int main()
                         }
                         rga_consume_cv.notify_one();
                     }
-                    // std::cout << "Frame captured and decoded successfully, length: "
-                    //   << frame_desc->payloadSize << " bytes" << std::endl;
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(recycle_mutex);
                     recycleQueue.push_back(frame_desc);
+                }
+            }
+        });
+
+    std::thread mpp_output_recycle_thread(
+        [&]()
+        {
+            while (true)
+            {
+                std::deque<const IO_FD_t*> pending_outputs;
+                {
+                    std::unique_lock<std::mutex> lock(mpp_recycle_output_mutex);
+                    mpp_recycle_output_cv.wait(
+                        lock,
+                        [&]() { return !mppRecycleOutputQueue.empty() || stop_requested.load(); });
+                    while (!mppRecycleOutputQueue.empty())
+                    {
+                        pending_outputs.push_back(mppRecycleOutputQueue.front());
+                        mppRecycleOutputQueue.pop_front();
+                    }
+                    if (pending_outputs.empty() && stop_requested.load())
+                    {
+                        break;
+                    }
+                }
+
+                for (const IO_FD_t* output_desc : pending_outputs)
+                {
+                    if (mpp_decoder_instance.DecQueueOutputForRecycle(output_desc) != 0)
+                    {
+                        std::cerr << "Failed to queue decoded output for recycle, fd="
+                                  << ((output_desc) ? output_desc->fd : -1) << std::endl;
+                    }
                 }
             }
         });
@@ -403,6 +434,7 @@ int main()
                     mppRecycleOutputQueue.push_back(
                         input_desc);  // 将处理完成的输出描述加入MPP 解码器回收队列
                 }
+                mpp_recycle_output_cv.notify_one();
                 rga_frame_count++;
                 if ((rga_frame_count % 300u) == 0u)
                 {
@@ -441,9 +473,8 @@ int main()
                 {
                     continue;
                 }
-
-                if (mpp_encoder_instance.EncodePushFrame(encode_input_desc) !=
-                    0)  // 将帧送入编码器失败
+                // 将 RGA 处理后的输出送入编码器，若失败则重试，重试超过阈值则记录错误并停止程序。
+                if (mpp_encoder_instance.EncodePushFrame(encode_input_desc) != 0)
                 {
                     encode_push_failures++;
                     if (encode_push_failures <= kMaxEncodePushRetry)
@@ -555,6 +586,10 @@ int main()
     if (mpp_encode_output_thread.joinable())
     {
         mpp_encode_output_thread.join();
+    }
+    if (mpp_output_recycle_thread.joinable())
+    {
+        mpp_output_recycle_thread.join();
     }
     drain_mpp_recycle_requests();  // 确保所有待回收的输出都被处理掉，避免资源泄漏
 

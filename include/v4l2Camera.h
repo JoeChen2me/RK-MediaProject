@@ -10,10 +10,10 @@
 
 namespace camera_params
 {
-inline constexpr __u32  kCaptureWidth  = 640;
-inline constexpr __u32  kCaptureHeight = 480;
+inline constexpr __u32  kCaptureWidth  = 1920;
+inline constexpr __u32  kCaptureHeight = 1080;
 inline constexpr __u32  kCaptureFps    = 30;
-inline constexpr size_t kMaxFrameSize  = 1024 * 1024;
+inline constexpr size_t kMaxFrameSize  = 4096 * 4096;
 inline constexpr __u32  kRequestBufferCount =
     static_cast<__u32>(resource_limits::kCameraRequestBufferCount);
 inline constexpr size_t kMaxMappedBuffers = resource_limits::kCameraMappedBufferCount;
