@@ -12,6 +12,10 @@
       "includePath": [
         "${workspaceFolder}/include",
         "${workspaceFolder}/src",
+        "${workspaceFolder}/experiments/mpp_src_try/mpp/inc",
+        "${workspaceFolder}/experiments/mpp_src_try/mpp/osal/inc",
+        "${workspaceFolder}/experiments/mpp_src_try/mpp/utils",
+        "${workspaceFolder}/experiments/mpp_src_try/mpp/mpp/base/inc",
         "/usr/include",
         "/usr/include/rockchip",
         "/usr/include/rga",
