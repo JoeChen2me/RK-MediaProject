@@ -24,6 +24,7 @@ add_executable(app
 # RK 平台常见头文件路径：/usr/include/rockchip, /usr/include/rga
 target_include_directories(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ZLM
     /usr/include/rockchip
     /usr/include/rga
 )
@@ -48,11 +49,44 @@ target_include_directories(app PRIVATE ${RGA_INCLUDE_DIR})
 find_library(ROCKCHIP_MPP_LIB NAMES rockchip_mpp REQUIRED)
 find_library(RGA_LIB NAMES rga REQUIRED)
 
+# 本地 ZLMediaKit C API 动态库及头文件
+set(ZLM_LOCAL_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include/ZLM)
+set(ZLM_LOCAL_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lib)
+
+if (NOT EXISTS ${ZLM_LOCAL_INCLUDE_DIR}/mk_mediakit.h)
+    message(FATAL_ERROR "Failed to find ZLM C API headers in ${ZLM_LOCAL_INCLUDE_DIR}")
+endif()
+
+find_library(ZLM_MK_API_LIB
+    NAMES mk_api
+    PATHS ${ZLM_LOCAL_LIB_DIR}
+    NO_DEFAULT_PATH
+)
+if (NOT ZLM_MK_API_LIB)
+    message(FATAL_ERROR "Failed to find libmk_api.so in ${ZLM_LOCAL_LIB_DIR}")
+endif()
+
+find_library(ZLM_TOOLKIT_LIB
+    NAMES ZLToolKit
+    PATHS ${ZLM_LOCAL_LIB_DIR}
+    NO_DEFAULT_PATH
+)
+if (NOT ZLM_TOOLKIT_LIB)
+    message(FATAL_ERROR "Failed to find libZLToolKit.so in ${ZLM_LOCAL_LIB_DIR}")
+endif()
+
 target_link_libraries(app PRIVATE
     Threads::Threads
     v4l2
     ${ROCKCHIP_MPP_LIB}
     ${RGA_LIB}
+    ${ZLM_MK_API_LIB}
+    ${ZLM_TOOLKIT_LIB}
+)
+
+# 运行时优先从项目根目录下的 lib/ 加载动态库
+set_target_properties(app PROPERTIES
+    BUILD_RPATH ${ZLM_LOCAL_LIB_DIR}
 )
 
 # Keep warnings consistent with tasks.json
