@@ -10,6 +10,7 @@
 #include "rkmppdec.h"
 #include "rkrga.h"
 #include "v4l2Camera.h"
+#include "rkmppenc.h"
 
 const std::string            device      = "/dev/video0";  // USB 摄像头路径
 static volatile sig_atomic_t should_exit = 0;              // 用于控制程序退出的标志
@@ -66,26 +67,47 @@ int main()
         return 1;
     }
 
-    std::mutex                 ready_mutex;
-    std::mutex                 recycle_mutex;
-    std::mutex                 rga_consume_mutex;
-    std::mutex                 mpp_recycle_output_mutex;
-    std::condition_variable    ready_cv;
-    std::condition_variable    rga_consume_cv;
-    std::deque<FrameDesc*>     readyQueue;
-    std::deque<FrameDesc*>     recycleQueue;
-    std::deque<const IO_FD_t*> rgaConsumeQueue;
-    std::deque<const IO_FD_t*> mppRecycleOutputQueue;
-    std::atomic_bool           stop_requested{false};
-    std::atomic_bool           fatal_error{false};
-    size_t                     dropped_frames      = 0;
-    constexpr size_t           kMaxReadyQueueDepth = 3;  // 控制端到端延迟，超限时丢弃最旧帧
+    MppEncInstance mpp_encoder_instance;
+    if (mpp_encoder_instance.EncInit() != 0)
+    {
+        std::cerr << "Failed to initialize MPP encoder instance" << std::endl;
+        return 1;
+    }
+    if (mpp_encoder_instance.EncConfigWidthHeight(active_cfg.width, active_cfg.height, 0, 0) != 0)
+    {
+        std::cerr << "Failed to configure MPP encoder width and height" << std::endl;
+        return 1;
+    }
+
+    std::mutex ready_mutex;        // 保护 readyQueue 的互斥锁 相机->解码线程
+    std::mutex recycle_mutex;      // 保护 recycleQueue 的互斥锁 解码线程->相机
+    std::mutex rga_consume_mutex;  // 保护 rgaConsumeQueue 的互斥锁 解码线程->RGA 线程
+    std::mutex mpp_recycle_output_mutex;  // 保护 mppRecycleOutputQueue 的互斥锁 RGA 线程->解码线程
+    std::mutex mpp_encode_input_mutex;  // 保护 mppEncodeInputQueue 的互斥锁 RGA 线程->编码线程
+    std::mutex              rga_pool_mutex;  // 保护 RGA 输出池回收与分配路径
+    std::condition_variable ready_cv;  // 用于通知解码线程有新帧可处理的条件变量
+    std::condition_variable rga_consume_cv;  // 用于通知 RGA 线程有新帧可处理的条件变量
+    std::condition_variable mpp_encode_input_cv;  // 用于通知编码输入线程有新帧可处理
+    std::deque<FrameDesc*>  readyQueue;  // 存储已捕获但未解码的帧描述指针的队列
+    std::deque<FrameDesc*> recycleQueue;  /// 存储已处理完毕、等待回收的帧描述指针的队列
+    std::deque<const IO_FD_t*> rgaConsumeQueue;  // 存储已解码但未 RGA 处理的帧描述指针的队列
+    std::deque<const IO_FD_t*>
+        mppRecycleOutputQueue;  // 存储已 RGA 处理但未回收的输出描述指针的队列
+    std::deque<const IO_FD_t*> mppEncodeInputQueue;  // 存储已 RGA 处理但未送编码的帧描述指针的队列
+
+    // 开关
+    std::atomic_bool stop_requested{false};
+    std::atomic_bool fatal_error{false};
+    // 统计信息
+    size_t           dropped_frames      = 0;
+    constexpr size_t kMaxReadyQueueDepth = 3;  // 控制端到端延迟，超限时丢弃最旧帧
 
     auto request_stop = [&]()
     {
         stop_requested.store(true);
         ready_cv.notify_all();
         rga_consume_cv.notify_all();
+        mpp_encode_input_cv.notify_all();
     };
 
     auto drain_mpp_recycle_requests = [&]()
@@ -291,6 +313,9 @@ int main()
     std::thread rga_thread(
         [&]()
         {
+            constexpr size_t kMaxRgaTransformRetry = 2000;  // 约 4 秒重试窗口
+            size_t           rga_frame_count       = 0;
+            bool             encoder_io_ready      = false;
             while (true)
             {
                 const IO_FD_t* input_desc = nullptr;
@@ -315,20 +340,188 @@ int main()
                     continue;
                 }
 
-                const IO_FD_t* rga_output =
-                    rga_instance.FlipHorizontal(input_desc);  // 以水平翻转为例进行 RGA 处理
-                if (rga_output == nullptr)
+                const IO_FD_t* rga_output      = nullptr;
+                size_t         rga_retry_count = 0;
+                while (!stop_requested.load())
                 {
-                    std::cerr << "RGA processing failed, fd=" << input_desc->fd << std::endl;
+                    {
+                        std::lock_guard<std::mutex> lock(rga_pool_mutex);
+                        rga_output =
+                            rga_instance.FlipHorizontal(input_desc);  // 以水平翻转为例进行 RGA 处理
+                    }
+                    if (rga_output != nullptr)
+                    {
+                        break;
+                    }
+
+                    rga_retry_count++;
+                    if (rga_retry_count >= kMaxRgaTransformRetry)
+                    {
+                        std::cerr << "RGA processing failed repeatedly, fd=" << input_desc->fd
+                                  << ", retry_count=" << rga_retry_count << std::endl;
+                        fatal_error.store(true);
+                        request_stop();
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+
+                if (rga_output != nullptr)
+                {
+                    if (!encoder_io_ready)
+                    {
+                        if (mpp_encoder_instance.AllocBufferForIO(
+                                rga_instance.output_pool_,
+                                resource_limits::kRgaOutputBufferCount) != 0)
+                        {
+                            std::cerr << "Failed to import RGA output buffers for encoder"
+                                      << std::endl;
+                            {
+                                std::lock_guard<std::mutex> lock(rga_pool_mutex);
+                                (void)rga_instance.RgaQueueOutputForRecycle(rga_output);
+                            }
+                            fatal_error.store(true);
+                            request_stop();
+                        }
+                        else
+                        {
+                            encoder_io_ready = true;
+                        }
+                    }
+                    if (encoder_io_ready && !stop_requested.load() && rga_output != nullptr)
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
+                            mppEncodeInputQueue.push_back(rga_output);  // 压入MPP编码输入队列
+                        }
+                        mpp_encode_input_cv.notify_one();
+                    }
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(mpp_recycle_output_mutex);  // 获取锁
                     mppRecycleOutputQueue.push_back(
-                        input_desc);  // 将处理完成的输出描述加入回收队列
+                        input_desc);  // 将处理完成的输出描述加入MPP 解码器回收队列
                 }
-                std::cout << "Frame processed by RGA and queued for recycle, fd=" << input_desc->fd
-                          << std::endl;
+                rga_frame_count++;
+                if ((rga_frame_count % 300u) == 0u)
+                {
+                    std::cout << "RGA processed frames: " << rga_frame_count
+                              << ", last_input_fd=" << input_desc->fd << std::endl;
+                }
+            }
+        });
+
+    std::thread mpp_encode_input_thread(
+        [&]()
+        {
+            constexpr size_t kMaxEncodePushRetry  = 200;
+            size_t           encode_push_failures = 0;
+            while (true)
+            {
+                const IO_FD_t* encode_input_desc = nullptr;
+                {
+                    std::unique_lock<std::mutex> lock(mpp_encode_input_mutex);
+                    mpp_encode_input_cv.wait(
+                        lock,
+                        [&]() { return !mppEncodeInputQueue.empty() || stop_requested.load(); });
+                    if (mppEncodeInputQueue.empty())
+                    {
+                        if (stop_requested.load())
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    encode_input_desc = mppEncodeInputQueue.front();
+                    mppEncodeInputQueue.pop_front();
+                }
+
+                if (!encode_input_desc)
+                {
+                    continue;
+                }
+
+                if (mpp_encoder_instance.EncodePushFrame(encode_input_desc) !=
+                    0)  // 将帧送入编码器失败
+                {
+                    encode_push_failures++;
+                    if (encode_push_failures <= kMaxEncodePushRetry)
+                    {
+                        if ((encode_push_failures % 20u) == 1u)
+                        {
+                            std::cerr
+                                << "Encode push temporary failure, fd=" << encode_input_desc->fd
+                                << ", retry=" << encode_push_failures << std::endl;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
+                            mppEncodeInputQueue.push_front(
+                                encode_input_desc);  // 回队重试，避免瞬时失败直接中断流程
+                        }
+                        mpp_encode_input_cv.notify_one();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        continue;
+                    }
+
+                    std::cerr << "Failed to push frame to encoder after retries, fd="
+                              << encode_input_desc->fd << ", retry=" << encode_push_failures
+                              << std::endl;
+                    {
+                        std::lock_guard<std::mutex> lock(rga_pool_mutex);
+                        (void)rga_instance.RgaQueueOutputForRecycle(
+                            encode_input_desc);  // 重试后仍失败，回收该输出避免资源泄漏
+                    }
+                    fatal_error.store(true);
+                    request_stop();
+                    break;
+                }
+
+                encode_push_failures = 0;
+                {
+                    // encode_put_frame 默认为阻塞调用，返回时输入图像已可归还给调用方
+                    std::lock_guard<std::mutex> lock(rga_pool_mutex);
+                    if (rga_instance.RgaQueueOutputForRecycle(encode_input_desc) != 0)
+                    {
+                        std::cerr << "Failed to recycle RGA output after encode_put_frame, fd="
+                                  << encode_input_desc->fd << std::endl;
+                        fatal_error.store(true);
+                        request_stop();
+                        break;
+                    }
+                }
+            }
+        });
+
+    std::thread mpp_encode_output_thread(
+        [&]()
+        {
+            while (!stop_requested.load())
+            {
+                const int get_packet_ret = mpp_encoder_instance.EncoderGetPacket();
+                if (get_packet_ret < 0)
+                {
+                    std::cerr << "Failed to get encoded packet from encoder" << std::endl;
+                    fatal_error.store(true);
+                    request_stop();
+                    break;
+                }
+                if (get_packet_ret == 0)
+                {
+                    if (mpp_encoder_instance.IsPacketEOS())
+                    {
+                        request_stop();
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                    continue;
+                }
+
+                if (mpp_encoder_instance.IsPacketEOS())
+                {
+                    request_stop();
+                    break;
+                }
             }
         });
 
@@ -342,21 +535,49 @@ int main()
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     // 请求所有线程停止，并等待它们退出
+    request_stop();
     if (capture_thread.joinable())
     {
         capture_thread.join();
     }
-    request_stop();  // 保证解码线程在无任务时也能被唤醒退出
     if (decode_thread.joinable())
     {
         decode_thread.join();
     }
-    rga_consume_cv.notify_all();
     if (rga_thread.joinable())
     {
         rga_thread.join();
     }
+    if (mpp_encode_input_thread.joinable())
+    {
+        mpp_encode_input_thread.join();
+    }
+    if (mpp_encode_output_thread.joinable())
+    {
+        mpp_encode_output_thread.join();
+    }
     drain_mpp_recycle_requests();  // 确保所有待回收的输出都被处理掉，避免资源泄漏
+
+    {
+        std::deque<const IO_FD_t*> pending_encode_inputs;
+        {
+            std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
+            while (!mppEncodeInputQueue.empty())
+            {
+                pending_encode_inputs.push_back(mppEncodeInputQueue.front());
+                mppEncodeInputQueue.pop_front();
+            }
+        }
+        for (const IO_FD_t* output_desc : pending_encode_inputs)
+        {
+            std::lock_guard<std::mutex> lock(rga_pool_mutex);
+            if (rga_instance.RgaQueueOutputForRecycle(output_desc) != 0)
+            {
+                std::cerr << "Failed to recycle pending encoder input descriptor, fd="
+                          << ((output_desc) ? output_desc->fd : -1) << std::endl;
+            }
+        }
+    }
 
     // 退出阶段不再执行回队，交由 V4L2 反初始化流程（STREAMOFF + REQBUFS(0)）统一释放。
     {
@@ -374,6 +595,10 @@ int main()
     {
         std::lock_guard<std::mutex> lock(mpp_recycle_output_mutex);
         mppRecycleOutputQueue.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
+        mppEncodeInputQueue.clear();
     }
 
     // 依赖析构函数完成资源的回收

@@ -17,6 +17,13 @@
 #include <mutex>
 #include <vector>
 
+namespace
+{
+constexpr uint32_t kDefaultFps        = 30;               // 默认帧率
+constexpr uint32_t kDefaultBitrateBps = 2 * 1024 * 1024;  // 默认码率 2 Mbps
+constexpr uint32_t kDefaultGop        = 2 * kDefaultFps;  // 默认 GOP 长度为 2 秒
+}  // namespace
+
 class MppEncInstance
 {
    public:
@@ -24,7 +31,8 @@ class MppEncInstance
     ~MppEncInstance();
     int  EncInit(MppCodingType EncodingType = MPP_VIDEO_CodingAVC);
     int  EncConfigWidthHeight(uint32_t width, uint32_t height, uint32_t hor_stride,
-                              uint32_t ver_stride, uint32_t fps, uint32_t bitrate_bps, uint32_t gop);
+                              uint32_t ver_stride, uint32_t fps = kDefaultFps,
+                              uint32_t bitrate_bps = kDefaultBitrateBps, uint32_t gop = kDefaultGop);
     int  EncodePushFrame(const IO_FD_t* input_desc);
     int  EncoderGetPacket(void);
     int  EncoderImportBufferFromFD(const IO_FD_t* FD_Array, size_t count);
@@ -53,6 +61,7 @@ class MppEncInstance
     bool                     FD_Imported_ = false;  // 当前输入帧的 dma-buf fd 是否已成功导入到 MPP
     bool     ExtraInfoGotten_ = false;  // 是否已获取过编码器输出的额外信息（如 SPS/PPS）
     uint64_t InputFrameId     = 0;      // 统计信息：输入帧 ID，递增以区分不同帧
+    bool     AllocBufferDone_ = false;  // 是否已完成输入缓冲的分配和导入
     bool     ReachPacketEOS_  = false;  // 是否已到达输出 packet 的 EOS 标志
 };
 

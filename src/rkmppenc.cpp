@@ -1,4 +1,5 @@
 #include "rkmppenc.h"
+#include <rockchip/mpp_err.h>
 
 namespace
 {
@@ -22,6 +23,22 @@ MppEncInstance::~MppEncInstance()
         mpp_enc_cfg_deinit(this->enc_cfg_);
         this->enc_cfg_ = nullptr;
     }
+    for (auto& buf : MapBufferFromFD)
+    {
+        if (buf)
+        {
+            mpp_buffer_put(buf);  // 释放 MppBuffer 资源
+            buf = nullptr;
+        }
+    }
+    ImportedFdMap_.clear();    // 清理映射关系
+    AllocBufferDone_ = false;  // 重置状态，防止误用
+    if (this->group_)
+    {
+        mpp_buffer_group_clear(this->group_);  // 清理缓冲池中的所有缓冲，确保没有缓冲被占用
+        mpp_buffer_group_put(this->group_);  // 释放缓冲池资源
+        this->group_ = nullptr;
+    }
     if (this->mpp_ctx_)
     {
         mpp_destroy(this->mpp_ctx_);
@@ -44,7 +61,7 @@ int MppEncInstance::EncInit(MppCodingType EncodingType)
     }
 
     EncodingType_ = EncodingType;
-    ret           = mpp_init(mpp_ctx_, MPP_CTX_ENC, EncodingType_);  // 编码器类型 指定编码格式
+    ret = mpp_init(mpp_ctx_, MPP_CTX_ENC, EncodingType_);  // 编码器类型 指定编码格式
     if (ret != MPP_OK)
     {
         goto fail;
@@ -72,6 +89,8 @@ int MppEncInstance::EncInit(MppCodingType EncodingType)
         goto fail;
     }
 
+    ReachPacketEOS_ = false;
+
     return 0;
 fail:
     if (enc_cfg_)
@@ -98,17 +117,21 @@ int MppEncInstance::EncConfigWidthHeight(uint32_t width, uint32_t height, uint32
         return -1;
     }
     // 校验参数有效性
-    if (width == 0 || height == 0 || hor_stride == 0 || ver_stride == 0 || fps == 0 ||
-        bitrate_bps == 0 || gop == 0)
+    if (width == 0 || height == 0 || fps == 0 || bitrate_bps == 0 || gop == 0)
     {
+        std::cerr << "Invalid parameters for encoder configuration: width=" << width
+                  << ", height=" << height << ", fps=" << fps << ", bitrate_bps=" << bitrate_bps
+                  << ", gop=" << gop << std::endl;
         return -1;
     }
     MPP_RET ret = MPP_NOK;
     ImgHeight_  = height;
     ImgWidth_   = width;
-    H_Stride_   = hor_stride;
-    V_Stride_   = ver_stride;
-    Fps_        = (fps > 0 ? fps : 30);  // 默认 30 fps
+    H_Stride_   = hor_stride > 0 ? hor_stride
+                                 : mpp_common::Align16(ImgWidth_);  // 这个值设置为 0 触发自动设置
+    V_Stride_   = ver_stride > 0 ? ver_stride
+                                 : mpp_common::Align16(ImgHeight_);  // 这个值设置为 0 触发自动设置
+    Fps_        = (fps > 0 ? fps : 30);                              // 默认 30 fps
     BitrateBps_ =
         bitrate_bps > 0
             ? bitrate_bps
@@ -220,7 +243,7 @@ int MppEncInstance::EncoderImportBufferFromFD(const IO_FD_t* FD_Array, size_t co
         }
         // 导入每个 fd 并存储对应的 MppBuffer 句柄
         MppBufferInfo info;
-        info.type  = MPP_BUFFER_TYPE_EXT_DMA;
+        info.type  = MPP_BUFFER_TYPE_DMA_HEAP;
         info.fd    = FD_Array[i].fd;
         info.size  = FD_Array[i].size;
         info.index = static_cast<int>(i);                     // 记录索引，便于后续管理
@@ -296,9 +319,8 @@ int MppEncInstance::AllocBufferForIO(const IO_FD_t* FD_Array, size_t count)
         return -1;  // 上下文未初始化
     }
     MPP_RET ret = MPP_NOK;
-    // 申请可缓存的 DRM 内存池
-    ret = mpp_buffer_group_get_internal(
-        &group_, static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE));
+    // 申请 DRM 内存池。当前平台库在 group_get 阶段传 flags 存在兼容性问题，先使用基础类型。
+    ret = mpp_buffer_group_get_internal(&group_, MPP_BUFFER_TYPE_DRM);
     if (ret != MPP_OK)
     {
         return -1;  // 获取内部缓冲区失败
@@ -312,6 +334,7 @@ int MppEncInstance::AllocBufferForIO(const IO_FD_t* FD_Array, size_t count)
         group_ = nullptr;
         return -1;  // 导入 fd 失败
     }
+    AllocBufferDone_ = true;  // 标记已完成输入缓冲的分配和导入
     return 0;
 }
 int MppEncInstance::EncodePushFrame(const IO_FD_t* input_desc)
@@ -323,6 +346,11 @@ int MppEncInstance::EncodePushFrame(const IO_FD_t* input_desc)
     if (mpp_api_ == nullptr || mpp_ctx_ == nullptr)
     {
         return -1;
+    }
+    if (!AllocBufferDone_)
+    {
+        std::cerr << "Input buffers have not been allocated and imported yet" << std::endl;
+        return -1;  // 输入缓冲未准备好
     }
     MPP_RET  ret         = MPP_NOK;
     MppFrame input_frame = nullptr;
@@ -358,6 +386,10 @@ int MppEncInstance::EncoderGetPacket(void)
     {
         MppPacket packet = nullptr;
         ret              = mpp_api_->encode_get_packet(mpp_ctx_, &packet);
+        if (ret == MPP_ERR_TIMEOUT)
+        {
+            return 0;
+        }
         if (ret != MPP_OK)
         {
             return -1;
@@ -399,5 +431,5 @@ int MppEncInstance::EncoderGetPacket(void)
             break;
         }
     }
-    return 0;
+    return 1;
 }

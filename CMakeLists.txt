@@ -13,6 +13,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_executable(app
     src/main.cpp
     src/rkmppdec.cpp
+    src/rkmppenc.cpp
     src/rkrga.cpp
     src/v4l2Camera.cpp
     # Examples: add more source files here

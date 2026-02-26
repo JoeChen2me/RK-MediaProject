@@ -375,7 +375,7 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
     IO_FD_t* dst = AcquireOutputPoolBuffer();
     if (!dst)
     {
-        std::cerr << "RGA output pool has no free buffer to acquire" << std::endl;
+        // 输出池暂时无可用缓冲，交由上层调度做背压等待重试。
         return nullptr;
     }
 

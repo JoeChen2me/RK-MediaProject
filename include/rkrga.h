@@ -23,6 +23,7 @@ class RgaInstance
     const IO_FD_t* FlipHorizontal(const IO_FD_t* src);
     const IO_FD_t* FlipVertical(const IO_FD_t* src);
     int            RgaQueueOutputForRecycle(const IO_FD_t* output_desc);
+    IO_FD_t        output_pool_[resource_limits::kRgaOutputBufferCount] = {};
 
    private:
     struct ImageConfig
@@ -55,9 +56,8 @@ class RgaInstance
     IO_FD_t*             AcquireOutputPoolBuffer();
     const IO_FD_t*       TransformInternal(const IO_FD_t* src, Operation op);
     size_t               CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) const;
-    bool                 initialized_                                         = false;
-    IO_FD_t              output_pool_[resource_limits::kRgaOutputBufferCount] = {};
-    bool                 output_pool_ready_                                   = false;
+    bool                 initialized_       = false;
+    bool                 output_pool_ready_ = false;
     std::queue<IO_FD_t*> output_pool_available_queue_;
     std::queue<IO_FD_t*> output_pool_pending_recycle_queue_;
 };
