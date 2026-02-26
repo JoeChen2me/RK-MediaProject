@@ -74,6 +74,7 @@ RgaInstance::RgaInstance()
         item.hor_stride = 0;
         item.ver_stride = 0;
     }
+    output_pool_in_use_.fill(false);
 }
 
 RgaInstance::~RgaInstance() { ReleaseOutputPool(); }
@@ -194,15 +195,15 @@ size_t RgaInstance::CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) cons
     return static_cast<size_t>(h_stride) * static_cast<size_t>(v_stride) * 3u / 2u;
 }
 
+// 约束：调用前需持有 output_pool_mutex_。
 // 功能：重置输出池队列状态。
-// 行为：先清空“可用队列”和“待回收队列”；若输出池已就绪，则把池内所有描述符重新入可用队列。
-void RgaInstance::ResetOutputPoolQueueState()
+// 行为：先清空可用队列并重置 in_use 状态；若输出池已就绪，则把池内所有描述符重新入可用队列。
+void RgaInstance::ResetOutputPoolQueueStateLocked()
 {
     // std::queue 无 clear() 接口，使用与空队列 swap 的方式清空历史元素。
     std::queue<IO_FD_t*> empty_available_queue;
-    std::queue<IO_FD_t*> empty_pending_recycle_queue;
-    output_pool_available_queue_.swap(empty_available_queue);
-    output_pool_pending_recycle_queue_.swap(empty_pending_recycle_queue);
+    output_pool_available_queue_.swap(empty_available_queue);  // 清空可用队列
+    output_pool_in_use_.fill(false);
 
     if (!output_pool_ready_)
     {
@@ -216,21 +217,10 @@ void RgaInstance::ResetOutputPoolQueueState()
     }
 }
 
-// 功能：把待回收队列中的描述符转移到可用队列。
-// 约束：仅做描述符搬运，不涉及内存释放。
-void RgaInstance::DrainPendingRecycleQueue()
+void RgaInstance::ResetOutputPoolQueueState()
 {
-    // 将待回收队列中的描述符回灌到可用队列，供下一次 Acquire 复用。
-    while (!output_pool_pending_recycle_queue_.empty())
-    {
-        IO_FD_t* out = output_pool_pending_recycle_queue_.front();
-        output_pool_pending_recycle_queue_.pop();
-        if (!out)
-        {
-            continue;
-        }
-        output_pool_available_queue_.push(out);
-    }
+    std::lock_guard<std::mutex> lock(output_pool_mutex_);
+    ResetOutputPoolQueueStateLocked();
 }
 
 // 功能：判断给定描述符是否属于当前 RGA 实例维护的输出池。
@@ -249,6 +239,7 @@ bool RgaInstance::IsOutputPoolMember(const IO_FD_t* output_desc) const
 // 功能：按源图像配置初始化输出池；若池已存在则做参数一致性校验。
 int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
 {
+    std::lock_guard<std::mutex> lock(output_pool_mutex_);
     if (!IsConfigValid(src_cfg))
     {
         std::cerr << "Failed to initialize output pool: source config is invalid" << std::endl;
@@ -279,7 +270,12 @@ int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
         if (AllocDmaBufFD(&out, SizeNeed) != 0)
         {
             std::cerr << "Failed to allocate output pool buffer, index=" << i << std::endl;
-            ReleaseOutputPool();
+            for (auto& pool_out : output_pool_)
+            {
+                ReleaseDmaBufFD(&pool_out);
+            }
+            output_pool_ready_ = false;
+            ResetOutputPoolQueueStateLocked();
             return -1;
         }
         out.width      = src_cfg.width;
@@ -289,31 +285,30 @@ int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
     }
 
     output_pool_ready_ = true;
-    ResetOutputPoolQueueState();
+    ResetOutputPoolQueueStateLocked();
     return 0;
 }
 
 // 功能：释放输出池的 dma-buf 资源，并同步重置队列状态。
 void RgaInstance::ReleaseOutputPool()
 {
+    std::lock_guard<std::mutex> lock(output_pool_mutex_);
     for (auto& out : output_pool_)
     {
         ReleaseDmaBufFD(&out);
     }
     output_pool_ready_ = false;
-    ResetOutputPoolQueueState();
+    ResetOutputPoolQueueStateLocked();
 }
 
-// 功能：从可用队列获取一个可写输出描述符。
-// 行为：获取前先处理待回收队列，使最近归还的资源能够被立即复用。
+// 功能：从可用队列获取一个可写输出描述符，并标记为 in_use。
 IO_FD_t* RgaInstance::AcquireOutputPoolBuffer()
 {
+    std::lock_guard<std::mutex> lock(output_pool_mutex_);
     if (!output_pool_ready_)
     {
         return nullptr;
     }
-
-    DrainPendingRecycleQueue();
     if (output_pool_available_queue_.empty())
     {
         return nullptr;
@@ -321,22 +316,41 @@ IO_FD_t* RgaInstance::AcquireOutputPoolBuffer()
 
     IO_FD_t* out = output_pool_available_queue_.front();
     output_pool_available_queue_.pop();
+    if (!out)
+    {
+        return nullptr;
+    }
+    const size_t out_index = static_cast<size_t>(out - &output_pool_[0]);
+    if (out_index >= resource_limits::kRgaOutputBufferCount)
+    {
+        return nullptr;
+    }
+    output_pool_in_use_[out_index] = true;  // 标记正在使用
     return out;
 }
 
-// 功能：将已消费的输出描述符加入待回收队列。
+// 功能：将已消费的输出描述符直接放回可用队列，避免额外一次“待回收”中转。
 // 场景：当前主要用于错误路径兜底；后续可由外部消费者在消费完成后调用。
-// 说明：待回收队列在下次 Acquire 时统一回灌到可用队列。
-int RgaInstance::RgaQueueOutputForRecycle(const IO_FD_t* output_desc)
+int RgaInstance::QueueOutputToRecycle(const IO_FD_t* output_desc)
 {
+    std::lock_guard<std::mutex> lock(output_pool_mutex_);
     if (!output_desc || !output_pool_ready_ || !IsOutputPoolMember(output_desc))
     {
         std::cerr << "Invalid RGA output descriptor for recycle, fd="
                   << ((output_desc) ? output_desc->fd : -1) << std::endl;
         return -1;
     }
-
-    output_pool_pending_recycle_queue_.push(const_cast<IO_FD_t*>(output_desc));
+    const size_t out_index = static_cast<size_t>(output_desc - &output_pool_[0]);  // 求出index
+    if (out_index >= resource_limits::kRgaOutputBufferCount)
+    {
+        return -1;
+    }
+    if (!output_pool_in_use_[out_index])  // 已经归还了 无需再次重复归还
+    {
+        return 0;  // 已归还过时保持幂等，避免重复回收导致流程误判失败
+    }
+    output_pool_in_use_[out_index] = false;                                // 标记已经归还
+    output_pool_available_queue_.push(const_cast<IO_FD_t*>(output_desc));  // 推入可用队列
     return 0;
 }
 
@@ -383,7 +397,7 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
     rga_buffer_t        dst_buffer{};
     rga_buffer_handle_t src_handle            = 0;
     rga_buffer_handle_t dst_handle            = 0;
-    auto                recycle_dst_if_needed = [&]() { (void)RgaQueueOutputForRecycle(dst); };
+    auto                recycle_dst_if_needed = [&]() { (void)QueueOutputToRecycle(dst); };
 
     if (BuildRgaBuffer(src, src_cfg.width, src_cfg.height, src_cfg.h_stride, src_cfg.v_stride,
                        &src_buffer, &src_handle) != 0)

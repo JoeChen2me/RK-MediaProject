@@ -3,8 +3,10 @@
 
 #include "pubDataType.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <queue>
 
 namespace
@@ -22,7 +24,7 @@ class RgaInstance
     const IO_FD_t* Copy(const IO_FD_t* src);
     const IO_FD_t* FlipHorizontal(const IO_FD_t* src);
     const IO_FD_t* FlipVertical(const IO_FD_t* src);
-    int            RgaQueueOutputForRecycle(const IO_FD_t* output_desc);
+    int            QueueOutputToRecycle(const IO_FD_t* output_desc);
     IO_FD_t        output_pool_[resource_limits::kRgaOutputBufferCount] = {};
 
    private:
@@ -44,22 +46,23 @@ class RgaInstance
         kFlipVertical,
     };
 
-    int                  AllocDmaBufFD(IO_FD_t* output, size_t size);
-    void                 ReleaseDmaBufFD(IO_FD_t* output);
-    bool                 IsConfigValid(const ImageConfig& cfg) const;
-    bool                 LoadConfigFromIO(const IO_FD_t* io, ImageConfig* cfg) const;
-    int                  InitOutputPoolIfNeeded(const ImageConfig& src_cfg);
-    void                 ReleaseOutputPool();
-    void                 ResetOutputPoolQueueState();
-    void                 DrainPendingRecycleQueue();
-    bool                 IsOutputPoolMember(const IO_FD_t* output_desc) const;
-    IO_FD_t*             AcquireOutputPoolBuffer();
-    const IO_FD_t*       TransformInternal(const IO_FD_t* src, Operation op);
-    size_t               CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) const;
-    bool                 initialized_       = false;
-    bool                 output_pool_ready_ = false;
-    std::queue<IO_FD_t*> output_pool_available_queue_;
-    std::queue<IO_FD_t*> output_pool_pending_recycle_queue_;
+    int            AllocDmaBufFD(IO_FD_t* output, size_t size);
+    void           ReleaseDmaBufFD(IO_FD_t* output);
+    bool           IsConfigValid(const ImageConfig& cfg) const;
+    bool           LoadConfigFromIO(const IO_FD_t* io, ImageConfig* cfg) const;
+    int            InitOutputPoolIfNeeded(const ImageConfig& src_cfg);
+    void           ReleaseOutputPool();
+    void           ResetOutputPoolQueueState();
+    void           ResetOutputPoolQueueStateLocked();
+    bool           IsOutputPoolMember(const IO_FD_t* output_desc) const;
+    IO_FD_t*       AcquireOutputPoolBuffer();
+    const IO_FD_t* TransformInternal(const IO_FD_t* src, Operation op);
+    size_t         CalcNv12ImageSize(uint32_t h_stride, uint32_t v_stride) const;
+    bool           initialized_       = false;
+    bool           output_pool_ready_ = false;
+    std::mutex     output_pool_mutex_;
+    std::array<bool, resource_limits::kRgaOutputBufferCount> output_pool_in_use_{};
+    std::queue<IO_FD_t*>                                     output_pool_available_queue_;
 };
 
 #endif  // RK_RGA_H

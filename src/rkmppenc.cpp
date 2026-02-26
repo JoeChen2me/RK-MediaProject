@@ -203,6 +203,18 @@ int MppEncInstance::EncConfigWidthHeight(uint32_t width, uint32_t height, uint32
             return -1;
         }
     }
+    // 进行内存预分配 降低首帧编码时的延迟
+    ret = mpp_api_->control(mpp_ctx_, MPP_ENC_PRE_ALLOC_BUFF, NULL);
+    if (ret != MPP_OK)
+    {
+        return -1;
+    }
+    // 请求下一帧即为 IDR 帧，确保编码器输出的第一帧就是关键帧，便于后续解码器快速锁定和解析
+    ret = mpp_api_->control(mpp_ctx_, MPP_ENC_SET_IDR_FRAME, NULL);
+    if (ret != MPP_OK)
+    {
+        return -1;
+    }
     return 0;
 }
 
@@ -360,7 +372,8 @@ int MppEncInstance::EncodePushFrame(const IO_FD_t* input_desc)
     {
         return -1;
     }
-    ret = mpp_api_->encode_put_frame(mpp_ctx_, input_frame);
+    ret =
+        mpp_api_->encode_put_frame(mpp_ctx_, input_frame);  // 核心操作： 将输入帧送入编码器进行编码
     if (ret != MPP_OK)
     {
         mpp_frame_deinit(&input_frame);  // 释放输入帧资源，无需释放与其绑定的 Buffer
@@ -379,7 +392,7 @@ int MppEncInstance::EncoderGetPacket(void)
 {
     if (!mpp_api_ || !mpp_ctx_)
     {
-        return -1;
+        return mpp_enc_packet_result::kError;
     }
     MPP_RET ret = MPP_NOK;
     while (true)
@@ -388,16 +401,16 @@ int MppEncInstance::EncoderGetPacket(void)
         ret              = mpp_api_->encode_get_packet(mpp_ctx_, &packet);
         if (ret == MPP_ERR_TIMEOUT)
         {
-            return 0;
+            return mpp_enc_packet_result::kNoPacket;
         }
         if (ret != MPP_OK)
         {
-            return -1;
+            return mpp_enc_packet_result::kError;
         }
         if (packet == nullptr)
         {
             // 当前时刻无包可取，交给外层线程循环调度。
-            return 0;
+            return mpp_enc_packet_result::kNoPacket;
         }
 
         void*  ptr         = mpp_packet_get_pos(packet);
@@ -431,5 +444,5 @@ int MppEncInstance::EncoderGetPacket(void)
             break;
         }
     }
-    return 1;
+    return mpp_enc_packet_result::kHasPacket;
 }
