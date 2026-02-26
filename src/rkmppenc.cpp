@@ -90,6 +90,7 @@ int MppEncInstance::EncInit(MppCodingType EncodingType)
     }
 
     ReachPacketEOS_ = false;
+    InputFrameId    = 0;
 
     return 0;
 fail:
@@ -202,18 +203,6 @@ int MppEncInstance::EncConfigWidthHeight(uint32_t width, uint32_t height, uint32
         {
             return -1;
         }
-    }
-    // 进行内存预分配 降低首帧编码时的延迟
-    ret = mpp_api_->control(mpp_ctx_, MPP_ENC_PRE_ALLOC_BUFF, NULL);
-    if (ret != MPP_OK)
-    {
-        return -1;
-    }
-    // 请求下一帧即为 IDR 帧，确保编码器输出的第一帧就是关键帧，便于后续解码器快速锁定和解析
-    ret = mpp_api_->control(mpp_ctx_, MPP_ENC_SET_IDR_FRAME, NULL);
-    if (ret != MPP_OK)
-    {
-        return -1;
     }
     return 0;
 }
