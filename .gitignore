@@ -6,3 +6,4 @@ app
 node_modules/
 dist/
 experiments/
+third_party/
