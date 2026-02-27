@@ -91,6 +91,9 @@ int main()
         std::cerr << "Failed to initialize ZLM publisher" << std::endl;
         return 1;
     }
+    std::cout << "[ZLM] RTSP URL: " << zlm_publisher.GetRtspUrl() << std::endl;
+    std::cout << "[ZLM] WebRTC API(play): " << zlm_publisher.GetWebRtcApiUrl() << std::endl;
+    std::cout << "[ZLM] 请将地址中的 <设备IP> 替换为开发板实际 IP" << std::endl;
     uint32_t expected_fps = 30;
     if (active_cfg.fps_num > 0 && active_cfg.fps_den > 0)
     {
@@ -107,20 +110,20 @@ int main()
     std::atomic_uint64_t zlm_input_ok{0};
     std::atomic_uint64_t zlm_input_fail{0};
 
-    std::mutex ready_mutex;        // 保护 readyQueue 的互斥锁 相机->解码线程
-    std::mutex recycle_mutex;      // 保护 recycleQueue 的互斥锁 解码线程->相机
-    std::mutex rga_consume_mutex;  // 保护 rgaConsumeQueue 的互斥锁 解码线程->RGA 线程
+    std::mutex ready_mutex;               // 保护 readyQueue 的互斥锁 相机->解码线程
+    std::mutex recycle_mutex;             // 保护 recycleQueue 的互斥锁 解码线程->相机
+    std::mutex rga_consume_mutex;         // 保护 rgaConsumeQueue 的互斥锁 解码线程->RGA 线程
     std::mutex mpp_recycle_output_mutex;  // 保护 mppRecycleOutputQueue 的互斥锁 RGA 线程->解码线程
-    std::mutex mpp_encode_input_mutex;  // 保护 mppEncodeInputQueue 的互斥锁 RGA 线程->编码线程
-    std::condition_variable ready_cv;  // 用于通知解码线程有新帧可处理的条件变量
-    std::condition_variable rga_consume_cv;  // 用于通知 RGA 线程有新帧可处理的条件变量
-    std::condition_variable mpp_recycle_output_cv;  // 用于通知解码输出可回收线程有新数据
-    std::condition_variable mpp_encode_input_cv;  // 用于通知编码输入线程有新帧可处理
-    std::deque<FrameDesc*>  readyQueue;  // 存储已捕获但未解码的帧描述指针的队列
-    std::deque<FrameDesc*> recycleQueue;  /// 存储已处理完毕、等待回收的帧描述指针的队列
+    std::mutex mpp_encode_input_mutex;    // 保护 mppEncodeInputQueue 的互斥锁 RGA 线程->编码线程
+    std::condition_variable    ready_cv;  // 用于通知解码线程有新帧可处理的条件变量
+    std::condition_variable    rga_consume_cv;         // 用于通知 RGA 线程有新帧可处理的条件变量
+    std::condition_variable    mpp_recycle_output_cv;  // 用于通知解码输出可回收线程有新数据
+    std::condition_variable    mpp_encode_input_cv;    // 用于通知编码输入线程有新帧可处理
+    std::deque<FrameDesc*>     readyQueue;             // 存储已捕获但未解码的帧描述指针的队列
+    std::deque<FrameDesc*>     recycleQueue;     /// 存储已处理完毕、等待回收的帧描述指针的队列
     std::deque<const IO_FD_t*> rgaConsumeQueue;  // 存储已解码但未 RGA 处理的帧描述指针的队列
     std::deque<const IO_FD_t*>
-        mppRecycleOutputQueue;  // 存储已 RGA 处理但未回收的输出描述指针的队列
+        mppRecycleOutputQueue;                       // 存储已 RGA 处理但未回收的输出描述指针的队列
     std::deque<const IO_FD_t*> mppEncodeInputQueue;  // 存储已 RGA 处理但未送编码的帧描述指针的队列
 
     // 开关
@@ -347,7 +350,8 @@ int main()
                 std::unique_lock<std::mutex> lock(mpp_recycle_output_mutex);
                 mpp_recycle_output_cv.wait(
                     lock,
-                    [&]() {
+                    [&]()
+                    {
                         return !mppRecycleOutputQueue.empty() ||
                                (stop_requested.load() && rga_thread_done.load());
                     });

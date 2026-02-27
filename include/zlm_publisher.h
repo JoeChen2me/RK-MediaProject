@@ -3,9 +3,20 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 #include "rkmppenc.h"
 #include "mk_mediakit.h"
+
+struct ZlmPublishConfig
+{
+    uint16_t    rtsp_port = 8554;
+    uint16_t    http_port = 8000;
+    uint16_t    rtc_port  = 8001;
+    std::string vhost     = "__defaultVhost__";
+    std::string app       = "live";
+    std::string stream    = "camera";
+};
 
 class ZlmPublisher
 {
@@ -13,12 +24,14 @@ class ZlmPublisher
     ZlmPublisher();
     ~ZlmPublisher();
 
-    int      Init();
-    void     SetExpectedFps(uint32_t fps);
-    int      InputPacketChunk(const EncPacketView& pkt);
-    void     Close();
-    uint64_t GetOutputFrameCount() const { return OutputFrameCount_; }
-    uint64_t GetTimestampFallbackCount() const { return TimestampFallbackCount_; }
+    int         Init(const ZlmPublishConfig& cfg = {});
+    void        SetExpectedFps(uint32_t fps);
+    int         InputPacketChunk(const EncPacketView& pkt);
+    void        Close();
+    std::string GetRtspUrl() const;
+    std::string GetWebRtcApiUrl() const;
+    uint64_t    GetOutputFrameCount() const { return OutputFrameCount_; }
+    uint64_t    GetTimestampFallbackCount() const { return TimestampFallbackCount_; }
 
    private:
     struct NaluRange
@@ -32,7 +45,11 @@ class ZlmPublisher
     bool FindAnnexBPrefix(const uint8_t* data, size_t len, size_t pos, size_t* prefix_len) const;
     bool SplitAnnexBNalus(const uint8_t* data, size_t len, std::vector<NaluRange>* out_nalus) const;
 
-    mk_media Media_ = nullptr;
+    mk_media         Media_         = nullptr;
+    ZlmPublishConfig PublishConfig_ = {};
+    uint16_t         RtspPort_      = 0;
+    uint16_t         HttpPort_      = 0;
+    uint16_t         RtcPort_       = 0;
 
     uint64_t LastDtsUs_              = 0;
     uint64_t LastPtsUs_              = 0;

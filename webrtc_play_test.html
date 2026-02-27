@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebRTC 播放测试</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+      background: #f5f7fa;
+      color: #111;
+    }
+    .row {
+      margin-bottom: 12px;
+    }
+    input {
+      width: 100%;
+      max-width: 920px;
+      padding: 8px;
+      box-sizing: border-box;
+    }
+    button {
+      margin-right: 8px;
+      padding: 8px 14px;
+    }
+    video {
+      width: 960px;
+      max-width: 100%;
+      background: #000;
+    }
+    pre {
+      background: #fff;
+      border: 1px solid #ddd;
+      padding: 10px;
+      white-space: pre-wrap;
+      min-height: 100px;
+    }
+  </style>
+</head>
+<body>
+  <h2>WebRTC 播放测试</h2>
+  <div class="row">
+    <label for="api">WebRTC 协商地址</label><br />
+    <input id="api" value="http://10.126.126.58:8000/index/api/webrtc?app=live&stream=camera&type=play" />
+  </div>
+  <div class="row">
+    <button id="startBtn">开始播放</button>
+    <button id="stopBtn">停止</button>
+  </div>
+  <div class="row">
+    <video id="video" autoplay playsinline controls muted></video>
+  </div>
+  <div class="row">
+    <pre id="log"></pre>
+  </div>
+
+  <script>
+    const logEl = document.getElementById("log");
+    const videoEl = document.getElementById("video");
+    const apiEl = document.getElementById("api");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+
+    let pc = null;
+
+    function log(msg) {
+      logEl.textContent += `${new Date().toLocaleTimeString()} ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    function closePc() {
+      if (pc) {
+        pc.ontrack = null;
+        pc.onconnectionstatechange = null;
+        pc.close();
+        pc = null;
+      }
+      videoEl.srcObject = null;
+    }
+
+    async function waitIceComplete(peer) {
+      if (peer.iceGatheringState === "complete") return;
+      await new Promise((resolve) => {
+        const onState = () => {
+          if (peer.iceGatheringState === "complete") {
+            peer.removeEventListener("icegatheringstatechange", onState);
+            resolve();
+          }
+        };
+        peer.addEventListener("icegatheringstatechange", onState);
+      });
+    }
+
+    startBtn.onclick = async () => {
+      try {
+        closePc();
+        logEl.textContent = "";
+
+        const api = apiEl.value.trim();
+        if (!api) {
+          log("错误: 协商地址为空");
+          return;
+        }
+
+        pc = new RTCPeerConnection({ iceServers: [] });
+        pc.ontrack = (e) => {
+          if (e.streams && e.streams[0]) {
+            videoEl.srcObject = e.streams[0];
+            log("收到远端轨道，开始播放");
+          }
+        };
+        pc.onconnectionstatechange = () => {
+          log(`连接状态: ${pc.connectionState}`);
+        };
+
+        const offer = await pc.createOffer({
+          offerToReceiveVideo: true,
+          offerToReceiveAudio: false
+        });
+        await pc.setLocalDescription(offer);
+        await waitIceComplete(pc);
+        log("本地 offer 已生成，开始请求 answer");
+
+        const resp = await fetch(api, {
+          method: "POST",
+          headers: { "Content-Type": "application/sdp" },
+          body: pc.localDescription.sdp
+        });
+        const data = await resp.json();
+        if (data.code !== 0 || !data.sdp) {
+          throw new Error(`协商失败: ${JSON.stringify(data)}`);
+        }
+
+        await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+        log("设置远端 answer 成功");
+      } catch (err) {
+        log(`失败: ${err && err.message ? err.message : err}`);
+      }
+    };
+
+    stopBtn.onclick = () => {
+      closePc();
+      log("已停止");
+    };
+  </script>
+</body>
+</html>
