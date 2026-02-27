@@ -1,10 +1,26 @@
 #include "rkmppenc.h"
+
 #include <rockchip/mpp_err.h>
 
 namespace
 {
 constexpr RK_S64      kMppTimeoutMs   = 500;
 constexpr MppPollType kMppPollTimeout = static_cast<MppPollType>(500);
+
+void ResetPacketView(EncPacketView* pkt)
+{
+    if (!pkt)
+    {
+        return;
+    }
+    pkt->data     = nullptr;
+    pkt->len      = 0;
+    pkt->dts_ms   = -1;
+    pkt->pts_ms   = -1;
+    pkt->eos      = false;
+    pkt->is_extra = false;
+    pkt->handle   = nullptr;
+}
 }  // namespace
 
 MppEncInstance::MppEncInstance()
@@ -18,6 +34,17 @@ MppEncInstance::MppEncInstance()
 
 MppEncInstance::~MppEncInstance()
 {
+    if (this->HeaderBuf_)
+    {
+        mpp_buffer_put(this->HeaderBuf_);
+        this->HeaderBuf_ = nullptr;
+    }
+    if (this->HeaderBufGroup_)
+    {
+        mpp_buffer_group_put(this->HeaderBufGroup_);
+        this->HeaderBufGroup_ = nullptr;
+    }
+    HeaderBufSize_ = 0;
     if (this->enc_cfg_)
     {
         mpp_enc_cfg_deinit(this->enc_cfg_);
@@ -145,6 +172,31 @@ int MppEncInstance::EncConfigWidthHeight(uint32_t width, uint32_t height, uint32
     const size_t aligned_ver_stride =
         static_cast<size_t>((V_Stride_ + 63u) & ~63u);  // 相当于向上取整到 64 的倍数
     PacketBufSize_ = aligned_hor_stride * aligned_ver_stride * 3u / 2u;
+
+    if (HeaderBuf_ && HeaderBufSize_ < PacketBufSize_)
+    {
+        mpp_buffer_put(HeaderBuf_);
+        HeaderBuf_     = nullptr;
+        HeaderBufSize_ = 0;
+    }
+    if (!HeaderBufGroup_)
+    {
+        ret = mpp_buffer_group_get_internal(&HeaderBufGroup_, MPP_BUFFER_TYPE_DRM);
+        if (ret != MPP_OK || !HeaderBufGroup_)
+        {
+            return -1;
+        }
+    }
+    if (!HeaderBuf_)
+    {
+        size_t header_size = PacketBufSize_ > 0 ? PacketBufSize_ : static_cast<size_t>(1 << 20);
+        ret                = mpp_buffer_get(HeaderBufGroup_, &HeaderBuf_, header_size);
+        if (ret != MPP_OK || !HeaderBuf_)
+        {
+            return -1;
+        }
+        HeaderBufSize_ = header_size;
+    }
     /**
      * 三种需要配置的信息
      * 码率控制配置 RcCfg
@@ -209,16 +261,28 @@ int MppEncInstance::EncConfigWidthHeight(uint32_t width, uint32_t height, uint32
 
 int MppEncInstance::EncoderImportBufferFromFD(const IO_FD_t* FD_Array, size_t count)
 {
-    auto cleanup_import_resources = [&]()
+    std::vector<size_t> imported_indices;
+    std::vector<int>    imported_fds;
+    auto                cleanup_import_resources = [&]()
     {
-        for (size_t i = 0; i < count && i < resource_limits::kMppImportBufferCount; ++i)
+        for (size_t index : imported_indices)
         {
-            if (MapBufferFromFD[i])
+            if (index >= resource_limits::kMppImportBufferCount)
             {
-                mpp_buffer_put(MapBufferFromFD[i]);
-                MapBufferFromFD[i] = nullptr;
+                continue;
+            }
+            if (MapBufferFromFD[index])
+            {
+                mpp_buffer_put(MapBufferFromFD[index]);
+                MapBufferFromFD[index] = nullptr;
             }
         }
+        for (int fd : imported_fds)
+        {
+            ImportedFdMap_.erase(fd);
+        }
+        imported_indices.clear();
+        imported_fds.clear();
     };
     // 检查上下文指针情况
     if (!mpp_ctx_ || !mpp_api_)
@@ -258,6 +322,8 @@ int MppEncInstance::EncoderImportBufferFromFD(const IO_FD_t* FD_Array, size_t co
         }
         // 建立映射，方便后续进行回溯
         ImportedFdMap_[FD_Array[i].fd] = MapBufferFromFD[i];
+        imported_indices.push_back(i);
+        imported_fds.push_back(FD_Array[i].fd);
         imported_count++;  // 统计成功导入的 fd 数量
     }
     if (imported_count == 0)
@@ -302,7 +368,9 @@ int MppEncInstance::BuildInputFrameFromFd(const IO_FD_t* input_desc, MppFrame* o
     mpp_frame_set_ver_stride(*out_frame, static_cast<RK_S32>(V_Stride_));
     mpp_frame_set_fmt(*out_frame, MPP_FMT_YUV420SP);  // 设置输入格式，需与编码器配置的格式一致
     mpp_frame_set_buffer(*out_frame, inBuf->second);  // 将对应的 MppBuffer 句柄关联到 MppFrame 上
-    mpp_frame_set_pts(*out_frame, static_cast<RK_S64>(InputFrameId++));  // 使用递增的帧 ID 作为 PTS
+    const RK_S64 frame_id = static_cast<RK_S64>(InputFrameId++);
+    const RK_S64 fps      = static_cast<RK_S64>(Fps_ > 0 ? Fps_ : kDefaultFps);
+    mpp_frame_set_pts(*out_frame, frame_id * 1000 / fps);  // 使用毫秒时间戳
     if (isEos)
     {
         mpp_frame_set_eos(*out_frame, 1);  // 设置 EOS 标志
@@ -377,61 +445,113 @@ int MppEncInstance::EncodePushFrame(const IO_FD_t* input_desc)
     return 0;
 }
 
-int MppEncInstance::EncoderGetPacket(void)
+int MppEncInstance::EncoderGetExtraInfoPacket(EncPacketView* out)
 {
-    if (!mpp_api_ || !mpp_ctx_)
+    if (!out || !mpp_api_ || !mpp_ctx_)
+    {
+        return -1;
+    }
+    ResetPacketView(out);
+
+    if (!HeaderBuf_)
+    {
+        return -1;
+    }
+
+    MppPacket packet = nullptr;
+    MPP_RET   ret    = mpp_packet_init_with_buffer(&packet, HeaderBuf_);
+    if (ret != MPP_OK || !packet)
+    {
+        return -1;
+    }
+    mpp_packet_set_length(packet, 0);
+
+    ret = mpp_api_->control(mpp_ctx_, MPP_ENC_GET_HDR_SYNC, packet);
+    if (ret != MPP_OK)
+    {
+        mpp_packet_deinit(&packet);
+        return -1;
+    }
+
+    void*  ptr = mpp_packet_get_pos(packet);
+    size_t len = mpp_packet_get_length(packet);
+    if (!ptr || len == 0)
+    {
+        mpp_packet_deinit(&packet);
+        return -1;
+    }
+
+    out->data        = ptr;
+    out->len         = len;
+    out->dts_ms      = -1;
+    out->pts_ms      = -1;
+    out->eos         = false;
+    out->is_extra    = true;
+    out->handle      = packet;
+    ExtraInfoGotten_ = true;
+    return 0;
+}
+
+int MppEncInstance::EncoderGetPacket(EncPacketView* out)
+{
+    if (!out || !mpp_api_ || !mpp_ctx_)
     {
         return mpp_enc_packet_result::kError;
     }
-    MPP_RET ret = MPP_NOK;
-    while (true)
+    ResetPacketView(out);
+
+    MppPacket packet = nullptr;
+    MPP_RET   ret    = mpp_api_->encode_get_packet(mpp_ctx_, &packet);
+    if (ret == MPP_ERR_TIMEOUT)
     {
-        MppPacket packet = nullptr;
-        ret              = mpp_api_->encode_get_packet(mpp_ctx_, &packet);
-        if (ret == MPP_ERR_TIMEOUT)
-        {
-            return mpp_enc_packet_result::kNoPacket;
-        }
-        if (ret != MPP_OK)
-        {
-            return mpp_enc_packet_result::kError;
-        }
-        if (packet == nullptr)
-        {
-            // 当前时刻无包可取，交给外层线程循环调度。
-            return mpp_enc_packet_result::kNoPacket;
-        }
+        return mpp_enc_packet_result::kNoPacket;
+    }
+    if (ret != MPP_OK)
+    {
+        return mpp_enc_packet_result::kError;
+    }
+    if (!packet)
+    {
+        return mpp_enc_packet_result::kNoPacket;
+    }
 
-        void*  ptr         = mpp_packet_get_pos(packet);
-        size_t len         = mpp_packet_get_length(packet);
-        RK_U32 packet_eos  = mpp_packet_get_eos(packet);
-        RK_U32 packet_part = mpp_packet_is_partition(packet);
-        RK_U32 packet_eoi  = mpp_packet_is_eoi(packet);
-        RK_S64 packet_pts  = mpp_packet_get_pts(packet);
-        RK_S64 packet_dts  = mpp_packet_get_dts(packet);
-        // TODO 传递数据给 ZLMedia 来实现推流。由用户手动实现。但当前代码需要考虑这个点。
-        (void)ptr;
-        (void)len;
-        (void)packet_pts;
-        (void)packet_dts;
+    void*  ptr = mpp_packet_get_pos(packet);
+    size_t len = mpp_packet_get_length(packet);
+    if (!ptr || len == 0)
+    {
+        mpp_packet_deinit(&packet);
+        return mpp_enc_packet_result::kNoPacket;
+    }
 
-        // 资源回收
-        mpp_packet_deinit(&packet);  // 释放 packet 资源
+    out->data     = ptr;
+    out->len      = len;
+    out->dts_ms   = mpp_packet_get_dts(packet);
+    out->pts_ms   = mpp_packet_get_pts(packet);
+    out->eos      = (mpp_packet_get_eos(packet) != 0);
+    out->is_extra = false;
+    out->handle   = packet;
 
-        // 分片中间包：继续拉取直到 eoi/eos。
-        if (packet_part && !packet_eoi && !packet_eos)
-        {
-            continue;
-        }
-        // 非分片包、分片结尾包或 EOS 包，视为当前一帧输出结束，返回给外层调度。
-        else
-        {
-            if (packet_eos)
-            {
-                ReachPacketEOS_ = true;  // 标记已到达输出 EOS
-            }
-            break;
-        }
+    if (out->eos)
+    {
+        ReachPacketEOS_ = true;
     }
     return mpp_enc_packet_result::kHasPacket;
+}
+
+int MppEncInstance::EncoderReleasePacket(EncPacketView* pkt)
+{
+    if (!pkt)
+    {
+        return -1;
+    }
+    if (pkt->handle)
+    {
+        MPP_RET ret = mpp_packet_deinit(&pkt->handle);
+        if (ret != MPP_OK)
+        {
+            return -1;
+        }
+    }
+    ResetPacketView(pkt);
+    return 0;
 }

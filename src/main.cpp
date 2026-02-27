@@ -11,6 +11,7 @@
 #include "rkrga.h"
 #include "v4l2Camera.h"
 #include "rkmppenc.h"
+#include "zlm_publisher.h"
 
 const std::string            device      = "/dev/video0";  // USB 摄像头路径
 static volatile sig_atomic_t should_exit = 0;              // 用于控制程序退出的标志
@@ -77,6 +78,41 @@ int main()
     {
         std::cerr << "Failed to configure MPP encoder width and height" << std::endl;
         return 1;
+    }
+
+    ZlmPublisher zlm_publisher;
+    if (zlm_publisher.Init() != 0)
+    {
+        std::cerr << "Failed to initialize ZLM publisher" << std::endl;
+        return 1;
+    }
+
+    std::atomic_uint64_t enc_pkt_total{0};
+    std::atomic_uint64_t zlm_input_ok{0};
+    std::atomic_uint64_t zlm_input_fail{0};
+    std::atomic_uint64_t extra_pkt_sent{0};
+
+    EncPacketView extra_pkt;
+    if (mpp_encoder_instance.EncoderGetExtraInfoPacket(&extra_pkt) == 0)
+    {
+        if (zlm_publisher.InputPacketChunk(extra_pkt) == 0)
+        {
+            extra_pkt_sent.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+        {
+            zlm_input_fail.fetch_add(1, std::memory_order_relaxed);
+            std::cerr << "Failed to input encoder extra info packet to ZLM" << std::endl;
+        }
+        if (mpp_encoder_instance.EncoderReleasePacket(&extra_pkt) != 0)
+        {
+            std::cerr << "Failed to release encoder extra info packet" << std::endl;
+            return 1;
+        }
+    }
+    else
+    {
+        std::cerr << "Failed to get encoder extra info packet" << std::endl;
     }
 
     std::mutex ready_mutex;        // 保护 readyQueue 的互斥锁 相机->解码线程
@@ -536,11 +572,13 @@ int main()
     std::thread mpp_encode_output_thread(
         [&]()
         {
+            auto last_stat_tp = std::chrono::steady_clock::now();
             while (true)
             {
-                const bool stop_now       = stop_requested.load();
-                const bool input_done     = encode_input_done.load();
-                const int  get_packet_ret = mpp_encoder_instance.EncoderGetPacket();
+                const bool    stop_now   = stop_requested.load();
+                const bool    input_done = encode_input_done.load();
+                EncPacketView pkt_view;
+                const int     get_packet_ret = mpp_encoder_instance.EncoderGetPacket(&pkt_view);
                 if (get_packet_ret == mpp_enc_packet_result::kError)  // 出错
                 {
                     if (stop_now && input_done)
@@ -572,6 +610,38 @@ int main()
                     fatal_error.store(true);
                     request_stop();
                     break;
+                }
+
+                enc_pkt_total.fetch_add(1, std::memory_order_relaxed);
+                if (zlm_publisher.InputPacketChunk(pkt_view) == 0)
+                {
+                    zlm_input_ok.fetch_add(1, std::memory_order_relaxed);
+                }
+                else
+                {
+                    zlm_input_fail.fetch_add(1, std::memory_order_relaxed);
+                    std::cerr << "Failed to input encoded packet to ZLM, len=" << pkt_view.len
+                              << std::endl;
+                }
+                if (mpp_encoder_instance.EncoderReleasePacket(&pkt_view) != 0)
+                {
+                    std::cerr << "Failed to release encoded packet" << std::endl;
+                    fatal_error.store(true);
+                    request_stop();
+                    break;
+                }
+
+                const auto now_tp = std::chrono::steady_clock::now();
+                if (now_tp - last_stat_tp >= std::chrono::seconds(5))
+                {
+                    last_stat_tp = now_tp;
+                    std::cout << "[ENC->ZLM] enc_pkt_total=" << enc_pkt_total.load()
+                              << ", zlm_input_ok=" << zlm_input_ok.load()
+                              << ", zlm_input_fail=" << zlm_input_fail.load()
+                              << ", extra_pkt_sent=" << extra_pkt_sent.load()
+                              << ", zlm_frame_out=" << zlm_publisher.GetOutputFrameCount()
+                              << ", ts_fallback=" << zlm_publisher.GetTimestampFallbackCount()
+                              << std::endl;
                 }
 
                 if (mpp_encoder_instance.IsPacketEOS())
@@ -638,6 +708,8 @@ int main()
             }
         }
     }
+
+    zlm_publisher.Close();
 
     // 退出阶段不再执行回队，交由 V4L2 反初始化流程（STREAMOFF + REQBUFS(0)）统一释放。
     {

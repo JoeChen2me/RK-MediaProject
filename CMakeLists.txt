@@ -14,6 +14,7 @@ add_executable(app
     src/main.cpp
     src/rkmppdec.cpp
     src/rkmppenc.cpp
+    src/zlm_publisher.cpp
     src/rkrga.cpp
     src/v4l2Camera.cpp
     # Examples: add more source files here

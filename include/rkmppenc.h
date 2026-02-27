@@ -31,6 +31,17 @@ inline constexpr int kNoPacket  = 0;   // 当前时刻无可用输出包
 inline constexpr int kHasPacket = 1;   // 成功获取到至少一个输出包
 }  // namespace mpp_enc_packet_result
 
+struct EncPacketView
+{
+    const void* data     = nullptr;  // 当前 packet 数据指针
+    size_t      len      = 0;        // 当前 packet 长度
+    int64_t     dts_ms   = -1;       // packet dts（毫秒）
+    int64_t     pts_ms   = -1;       // packet pts（毫秒）
+    bool        eos      = false;    // packet 是否带 EOS
+    bool        is_extra = false;    // 是否为编码头信息（SPS/PPS）
+    MppPacket   handle   = nullptr;  // 需由 EncoderReleasePacket 释放
+};
+
 class MppEncInstance
 {
    public:
@@ -41,7 +52,9 @@ class MppEncInstance
                               uint32_t ver_stride, uint32_t fps = kDefaultFps,
                               uint32_t bitrate_bps = kDefaultBitrateBps, uint32_t gop = kDefaultGop);
     int  EncodePushFrame(const IO_FD_t* input_desc);
-    int  EncoderGetPacket(void);
+    int  EncoderGetPacket(EncPacketView* out);
+    int  EncoderGetExtraInfoPacket(EncPacketView* out);
+    int  EncoderReleasePacket(EncPacketView* pkt);
     int  EncoderImportBufferFromFD(const IO_FD_t* FD_Array, size_t count);
     int  BuildInputFrameFromFd(const IO_FD_t* input_desc, MppFrame* out_frame, bool isEos = false);
     int  AllocBufferForIO(const IO_FD_t* FD_Array, size_t count);
@@ -64,8 +77,11 @@ class MppEncInstance
     uint32_t                 Fps_          = 0;                    // 帧率
     uint32_t                 BitrateBps_   = 0;                    // 码率
     uint32_t                 Gop_          = 0;                    // 关键帧间隔
-    size_t PacketBufSize_ = 0;      // 输出 packet 缓冲建议大小（按单帧上界估算）
-    bool   FD_Imported_   = false;  // 当前输入帧的 dma-buf fd 是否已成功导入到 MPP
+    size_t PacketBufSize_ = 0;  // 输出 packet 缓冲建议大小（按单帧上界估算）
+    MppBufferGroup HeaderBufGroup_ = nullptr;  // 头信息抓取缓存组
+    MppBuffer      HeaderBuf_      = nullptr;  // 头信息抓取缓存
+    size_t         HeaderBufSize_  = 0;        // 头信息抓取缓存大小
+    bool FD_Imported_     = false;  // 当前输入帧的 dma-buf fd 是否已成功导入到 MPP
     bool ExtraInfoGotten_ = false;  // 是否已获取过编码器输出的额外信息（如 SPS/PPS）
     uint64_t InputFrameId     = 0;      // 统计信息：输入帧 ID，递增以区分不同帧
     bool     AllocBufferDone_ = false;  // 是否已完成输入缓冲的分配和导入

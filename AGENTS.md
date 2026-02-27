@@ -12,6 +12,10 @@
 1. `mpp 开发手册.md`
    - 路径：`/home/joe/Documents/DevelopDoc/mpp 开发手册.md`
    - 用途：MPP 编解码接口、流程与参数参考。
+  
+  - 路径：`experiments/mpp_src_try/mpp/doc/Rockchip_Developer_Guide_MPP_CN.md`
+  - 用途：官方最新 MPP 开发指南
+  
 
 2. `OrangePi5Plus-用户手册-md 格式.md`
    - 路径：`/home/joe/Documents/DevelopDoc/OrangePi5Plus-用户手册-md 格式.md`
