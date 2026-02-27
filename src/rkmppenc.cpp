@@ -13,13 +13,15 @@ void ResetPacketView(EncPacketView* pkt)
     {
         return;
     }
-    pkt->data     = nullptr;
-    pkt->len      = 0;
-    pkt->dts_ms   = -1;
-    pkt->pts_ms   = -1;
-    pkt->eos      = false;
-    pkt->is_extra = false;
-    pkt->handle   = nullptr;
+    pkt->data         = nullptr;
+    pkt->len          = 0;
+    pkt->dts_ms       = -1;
+    pkt->pts_ms       = -1;
+    pkt->eos          = false;
+    pkt->is_partition = false;
+    pkt->is_eoi       = false;
+    pkt->is_extra     = false;
+    pkt->handle       = nullptr;
 }
 }  // namespace
 
@@ -307,8 +309,8 @@ int MppEncInstance::EncoderImportBufferFromFD(const IO_FD_t* FD_Array, size_t co
             return -1;
         }
         // 导入每个 fd 并存储对应的 MppBuffer 句柄
-        MppBufferInfo info;
-        info.type  = MPP_BUFFER_TYPE_DMA_HEAP;
+        MppBufferInfo info{};
+        info.type  = MPP_BUFFER_TYPE_EXT_DMA;
         info.fd    = FD_Array[i].fd;
         info.size  = FD_Array[i].size;
         info.index = static_cast<int>(i);                     // 记录索引，便于后续管理
@@ -349,6 +351,23 @@ int MppEncInstance::BuildInputFrameFromFd(const IO_FD_t* input_desc, MppFrame* o
     {
         return -1;  // 输入描述无效
     }
+    const uint32_t input_fmt = (input_desc->format != 0 ? (input_desc->format & MPP_FRAME_FMT_MASK)
+                                                        : static_cast<uint32_t>(MPP_FMT_YUV420SP));
+    static bool    logged_input_fmt = false;
+    if (!logged_input_fmt)
+    {
+        logged_input_fmt = true;
+        std::cerr << "[ENC] first input fmt=" << input_fmt << ", w=" << input_desc->width
+                  << ", h=" << input_desc->height << ", hs=" << input_desc->hor_stride
+                  << ", vs=" << input_desc->ver_stride << ", size=" << input_desc->size
+                  << std::endl;
+    }
+    if (input_fmt != MPP_FMT_YUV420SP)
+    {
+        std::cerr << "Unsupported encoder input format, expect NV12(MPP_FMT_YUV420SP), got "
+                  << input_fmt << std::endl;
+        return -1;
+    }
     // 先根据 FD 拿到对应的 Buffer
     const auto inBuf = ImportedFdMap_.find(input_desc->fd);
     if (inBuf == ImportedFdMap_.end() || !inBuf->second)
@@ -362,11 +381,12 @@ int MppEncInstance::BuildInputFrameFromFd(const IO_FD_t* input_desc, MppFrame* o
     {
         return -1;  // 创建 MppFrame 失败
     }
-    mpp_frame_set_width(*out_frame, static_cast<RK_S32>(ImgWidth_));
-    mpp_frame_set_height(*out_frame, static_cast<RK_S32>(ImgHeight_));
-    mpp_frame_set_hor_stride(*out_frame, static_cast<RK_S32>(H_Stride_));
-    mpp_frame_set_ver_stride(*out_frame, static_cast<RK_S32>(V_Stride_));
-    mpp_frame_set_fmt(*out_frame, MPP_FMT_YUV420SP);  // 设置输入格式，需与编码器配置的格式一致
+    mpp_frame_set_width(*out_frame, static_cast<RK_S32>(input_desc->width));
+    mpp_frame_set_height(*out_frame, static_cast<RK_S32>(input_desc->height));
+    mpp_frame_set_hor_stride(*out_frame, static_cast<RK_S32>(input_desc->hor_stride));
+    mpp_frame_set_ver_stride(*out_frame, static_cast<RK_S32>(input_desc->ver_stride));
+    mpp_frame_set_fmt(*out_frame,
+                      static_cast<MppFrameFormat>(input_fmt));  // 使用输入描述的真实格式
     mpp_frame_set_buffer(*out_frame, inBuf->second);  // 将对应的 MppBuffer 句柄关联到 MppFrame 上
     const RK_S64 frame_id = static_cast<RK_S64>(InputFrameId++);
     const RK_S64 fps      = static_cast<RK_S64>(Fps_ > 0 ? Fps_ : kDefaultFps);
@@ -523,13 +543,15 @@ int MppEncInstance::EncoderGetPacket(EncPacketView* out)
         return mpp_enc_packet_result::kNoPacket;
     }
 
-    out->data     = ptr;
-    out->len      = len;
-    out->dts_ms   = mpp_packet_get_dts(packet);
-    out->pts_ms   = mpp_packet_get_pts(packet);
-    out->eos      = (mpp_packet_get_eos(packet) != 0);
-    out->is_extra = false;
-    out->handle   = packet;
+    out->data         = ptr;
+    out->len          = len;
+    out->dts_ms       = mpp_packet_get_dts(packet);
+    out->pts_ms       = mpp_packet_get_pts(packet);
+    out->eos          = (mpp_packet_get_eos(packet) != 0);
+    out->is_partition = (mpp_packet_is_partition(packet) != 0);
+    out->is_eoi       = (mpp_packet_is_eoi(packet) != 0);
+    out->is_extra     = false;
+    out->handle = packet;  // 将 MppPacket 句柄传递给调用者，由调用者负责后续的释放操作
 
     if (out->eos)
     {

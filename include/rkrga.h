@@ -3,6 +3,8 @@
 
 #include "pubDataType.h"
 
+#include <rockchip/mpp_frame.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +38,7 @@ class RgaInstance
         uint32_t h_stride = 0;
         // 历史命名：v_stride 对应垂直方向步幅（hstride，来自 IO_FD_t::ver_stride）。
         uint32_t v_stride = 0;
+        uint32_t format   = MPP_FMT_YUV420SP;
         bool     valid    = false;
     };
 

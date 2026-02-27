@@ -2,6 +2,7 @@
 #include "mpp_common_utils.h"
 
 #include <fcntl.h>  // open, O_RDWR, O_CLOEXEC
+#include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
@@ -17,6 +18,17 @@ namespace
 {
 constexpr MppPollType kPollTimeout500Ms   = static_cast<MppPollType>(500);
 constexpr auto        kHolderWaitInterval = std::chrono::milliseconds(100);
+
+bool dma_buf_sync_end_read(int fd)
+{
+    if (fd < 0)
+    {
+        return false;
+    }
+    dma_buf_sync sync{};
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    return ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) == 0;
+}
 }  // namespace
 
 MppDecInstance::MppDecInstance()
@@ -26,6 +38,7 @@ MppDecInstance::MppDecInstance()
         fd_info.fd         = -1;
         fd_info.base       = nullptr;
         fd_info.size       = 0;
+        fd_info.format     = 0;
         fd_info.width      = 0;
         fd_info.height     = 0;
         fd_info.hor_stride = 0;
@@ -161,7 +174,7 @@ int MppDecInstance::DecQueueOutputForRecycle(const IO_FD_t* output_desc)
     }
 
     PendingRecycleQueue.push_back(it->second);
-    OutDesc2HolderMap.erase(it);
+    OutDesc2HolderMap.erase(it);  // 擦除记录
     return 0;
 }
 
@@ -400,9 +413,10 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
         return -1;
     }
 
-    const int    buffer_index = frame_desc->index;
-    const void*  mapped_base  = frame_desc->base;
-    const size_t payload_size = frame_desc->payloadSize;
+    FrameDesc*   mutable_frame_desc = const_cast<FrameDesc*>(frame_desc);
+    const int    buffer_index       = frame_desc->index;
+    const void*  mapped_base        = frame_desc->base;
+    const size_t payload_size       = frame_desc->payloadSize;
 
     if (!mpp_ctx || !mpp_api || !group || !mapped_base || payload_size == 0 || OutSize == 0)
     {
@@ -421,25 +435,46 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
         return -1;
     }
 
-    MppBuffer input_buffer = MppBuffers[buffer_index];  // 拷贝一个指针
+    const auto*  input_data = static_cast<const uint8_t*>(mapped_base);  // 方便后续字节操作
+    const size_t effective_size = mpp_common::FindJpegEffectiveSize(
+        input_data, payload_size);  // 计算有效载荷大小，裁掉可能的对齐填充
+    if (effective_size == 0)
+    {
+        return -1;
+    }
+
+    // camera 线程在 DQBUF 后执行了 DMA_BUF_SYNC_START(READ)；
+    // CPU 读取完 JPEG 头后，需要在交给 MPP 硬件前结束 CPU 读访问窗口。
+    if (mutable_frame_desc && mutable_frame_desc->cpuSyncReadActive)
+    {
+        if (!dma_buf_sync_end_read(mutable_frame_desc->fd))
+        {
+            std::cerr << "Failed to end dma-buf cpu read sync before decode, fd="
+                      << mutable_frame_desc->fd << ": " << std::strerror(errno) << std::endl;
+            return -1;
+        }
+        mutable_frame_desc->cpuSyncReadActive = false;
+    }
+
+    MppBuffer input_buffer = MppBuffers[buffer_index];  // 零拷贝路径用导入的 camera dma-buf
     if (!input_buffer)
     {
         std::cerr << "Input MppBuffer is null, index=" << buffer_index << std::endl;
         return -1;
     }
-
-    const auto*  input_data     = static_cast<const uint8_t*>(mapped_base);  // 方便后续字节操作
-    const size_t effective_size = mpp_common::FindJpegEffectiveSize(
-        input_data, payload_size);  // 计算有效载荷大小，裁掉可能的对齐填充
-    if (effective_size == 0 || effective_size > mpp_buffer_get_size(input_buffer))
+    if (effective_size > mpp_buffer_get_size(input_buffer))
     {
+        std::cerr << "Effective jpeg size exceeds imported input buffer, size=" << effective_size
+                  << ", buf_size=" << mpp_buffer_get_size(input_buffer)
+                  << ", index=" << buffer_index << std::endl;
         return -1;
     }
 
     bool holder_wait_logged = false;
     while (!holder)
     {
-        holder = AcquireDecodedTaskHolder();
+        holder =
+            AcquireDecodedTaskHolder();  // 从资源池获取一个 holder 来承载本次解码任务的输出资源
         if (holder)
         {
             break;
@@ -502,18 +537,19 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
     mpp_frame_set_fmt(out_frm_local, MPP_FMT_YUV420SP);
     mpp_frame_set_buffer(out_frm_local, out_buf_local);
 
-    ret = mpp_packet_init_with_buffer(
-        &packet_local,
-        input_buffer);  // 将 buffer_index 对应的 MppBuffer 包装成 MppPacket 以供解码输入
+    ret = mpp_packet_init_with_buffer(&packet_local, input_buffer);
     if (ret != MPP_OK || !packet_local)
     {
         goto fail;
     }
+
     // 在用户态进行数据解析的必要操作
-    mpp_packet_set_data(packet_local,
-                        const_cast<void*>(mapped_base));  // 设置数据指针为映射后的基地址
-    mpp_packet_set_pos(packet_local,
-                       const_cast<void*>(mapped_base));   // 设置当前位置为映射后的基地址
+    mpp_packet_set_data(
+        packet_local,
+        const_cast<void*>(mapped_base));  // 设置数据指针为映射后的地址，供 MPP 内部访问
+    mpp_packet_set_pos(
+        packet_local,
+        const_cast<void*>(mapped_base));  // 设置当前位置指针为数据起始地址，供 MPP 内部访问
     mpp_packet_set_length(packet_local, effective_size);  // 设置数据长度为有效载荷大小
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);
@@ -547,7 +583,7 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
     }
     input_task_is_submitted = true;
     input_task              = nullptr;
-    packet_local            = nullptr;  // packet 已交给 input task，后续在回收该 task 时释放
+    packet_local = nullptr;  // packet 已交给 input task，后续在回收该 task 时释放
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_OUTPUT, kPollTimeout500Ms);
     if (ret < 0)
@@ -578,14 +614,12 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
                 goto fail;
             }
         }
-        // 模式三：info change 后重建外部输出缓冲池并重新绑定到解码器
-        size_t buf_size = mpp_frame_get_buf_size(decoded_frame);
-        OutSize =
-            (OutSize > buf_size)
-                ? OutSize
-                : buf_size;  // 更新输出缓冲大小，取当前值和解码器要求的最大值，避免过小导致后续解码失败
-        ret = mpp_buffer_group_limit_config(
-            group, OutSize, resource_limits::kMppOutputBufferCount);  // 更新缓冲上限配置
+        // 模式三：info change 后重建外部输出缓冲池并重新绑定到解码器。
+        // 注意：这里使用的是 frame 所需的缓冲容量，不用于像素格式判断。
+        const size_t required_buf_capacity = mpp_frame_get_buf_size(decoded_frame);
+        OutSize = (OutSize > required_buf_capacity) ? OutSize : required_buf_capacity;
+        ret     = mpp_buffer_group_limit_config(
+                group, OutSize, resource_limits::kMppOutputBufferCount);  // 更新缓冲上限配置
         if (ret != MPP_OK)
         {
             goto fail;
@@ -611,20 +645,21 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
         goto fail;
     }
 
-    outbuf_fd = mpp_buffer_get_fd(mpp_frame_get_buffer(decoded_frame));
+    outbuf_fd = mpp_buffer_get_fd(
+        mpp_frame_get_buffer(decoded_frame));  // 获取解码输出帧底层缓冲的 dma-buf fd
     if (outbuf_fd < 0)
     {
         goto fail;
     }
     {
-        const auto out_it = OutBufFD2Index_Map.find(outbuf_fd);
+        const auto out_it = OutBufFD2Index_Map.find(outbuf_fd);  // 根据映射关系找到对应的 IO_
         if (out_it == OutBufFD2Index_Map.end())
         {
             std::cerr << "Output fd is not in committed external buffer map, fd=" << outbuf_fd
                       << std::endl;
             goto fail;
         }
-        MappedBufferIndex = out_it->second;  // 查找输出 fd 对应的 MPP 缓冲索引
+        MappedBufferIndex = out_it->second;  // 查找输出 fd 对应的 MPP 缓冲索引，也就是知道 Index 了
     }
     {
         if (MappedBufferIndex >= resource_limits::kMppOutputBufferCount)
@@ -636,6 +671,8 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
         const RK_S32 frame_height = mpp_frame_get_height(decoded_frame);
         const RK_S32 frame_hs     = mpp_frame_get_hor_stride(decoded_frame);
         const RK_S32 frame_vs     = mpp_frame_get_ver_stride(decoded_frame);
+        const RK_S32 frame_fmt =
+            static_cast<RK_S32>(mpp_frame_get_fmt(decoded_frame) & MPP_FRAME_FMT_MASK);
         if (frame_width <= 0 || frame_height <= 0 || frame_hs <= 0 || frame_vs <= 0)
         {
             std::cerr << "Invalid decoded frame geometry: w=" << frame_width
@@ -643,13 +680,20 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
                       << std::endl;
             goto fail;
         }
+        if (!MPP_FRAME_FMT_IS_YUV(frame_fmt))
+        {
+            std::cerr << "Unsupported decoded frame format: fmt=" << frame_fmt << std::endl;
+            goto fail;
+        }
 
-        IO_FD_t& output_info   = MppOutputFDList[MappedBufferIndex];
+        IO_FD_t& output_info =
+            MppOutputFDList[MappedBufferIndex];  // 根据 index 获取对应的输出描述符信息结构体
+        output_info.format     = static_cast<uint32_t>(frame_fmt);
         output_info.width      = static_cast<uint32_t>(frame_width);
         output_info.height     = static_cast<uint32_t>(frame_height);
         output_info.hor_stride = static_cast<uint32_t>(frame_hs);
         output_info.ver_stride = static_cast<uint32_t>(frame_vs);
-        output_desc            = &output_info;
+        output_desc            = &output_info;  // 取地址
         CurrentOutputDesc      = output_desc;
     }
 
@@ -682,9 +726,10 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
     }
     input_task = nullptr;
 
-    holder->output_desc  = output_desc;
-    holder->output_frame = out_frm_local;
-    holder->output_buf   = out_buf_local;
+    holder->output_desc = output_desc;  // 记录输出描述符信息，供业务层后续回收时使用
+    holder->output_frame = out_frm_local;  // 记录输出帧信息，供业务层后续访问像素数据使用
+                                           // 这里记录的是指向实际对象的指针
+    holder->output_buf = out_buf_local;  // 记录输出缓冲信息，供业务层后续访问底层缓冲资源使用
     {
         std::lock_guard<std::mutex> lock(HolderMutex);
         if (OutDesc2HolderMap.find(output_desc) != OutDesc2HolderMap.end())
@@ -693,7 +738,8 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
                       << ((output_desc) ? output_desc->fd : -1) << std::endl;
             goto fail;
         }
-        OutDesc2HolderMap[output_desc] = holder;
+        OutDesc2HolderMap[output_desc] =
+            holder;  // 记录输出描述符到 holder 的映射关系，供后续回收时快速定位
     }
 
     out_frm_local = nullptr;
@@ -802,6 +848,7 @@ int MppDecInstance::AllocDmaBufFD(IO_FD_t& output, size_t size)
     output.fd         = req.fd;
     output.base       = mapped_base;
     output.size       = size;
+    output.format     = 0;
     output.width      = 0;
     output.height     = 0;
     output.hor_stride = 0;
@@ -836,6 +883,7 @@ void MppDecInstance::ReleaseExternalOutputBuffers()
             }
             output.fd = -1;
         }
+        output.format     = 0;
         output.width      = 0;
         output.height     = 0;
         output.hor_stride = 0;
@@ -886,7 +934,7 @@ int MppDecInstance::CommitExternalOutputBuffers(size_t size)
             return -1;
         }
         OutBufFD2Index_Map[output.fd] =
-            i;                  // 记录成功提交的输出缓冲 fd 与索引映射，便于后续按 fd 反查索引
+            i;  // 记录成功提交的输出缓冲 fd 与索引映射，便于后续按 fd 反查索引
         commit.fd = output.fd;  // 提交外部 dma-buf fd 给 MPP 在 group 生命周期内使用
         commit.ptr =
             nullptr;  // MPP_BUFFER_TYPE_EXT_DMA 模式下 ptr 不需要设置，确保为 nullptr 以免误用

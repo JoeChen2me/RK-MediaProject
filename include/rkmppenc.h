@@ -33,13 +33,15 @@ inline constexpr int kHasPacket = 1;   // 成功获取到至少一个输出包
 
 struct EncPacketView
 {
-    const void* data     = nullptr;  // 当前 packet 数据指针
-    size_t      len      = 0;        // 当前 packet 长度
-    int64_t     dts_ms   = -1;       // packet dts（毫秒）
-    int64_t     pts_ms   = -1;       // packet pts（毫秒）
-    bool        eos      = false;    // packet 是否带 EOS
-    bool        is_extra = false;    // 是否为编码头信息（SPS/PPS）
-    MppPacket   handle   = nullptr;  // 需由 EncoderReleasePacket 释放
+    const void* data         = nullptr;  // 当前 packet 数据指针
+    size_t      len          = 0;        // 当前 packet 长度
+    int64_t     dts_ms       = -1;       // packet dts（毫秒）
+    int64_t     pts_ms       = -1;       // packet pts（毫秒）
+    bool        eos          = false;    // packet 是否带 EOS
+    bool        is_partition = false;    // packet 是否为分片输出
+    bool        is_eoi       = false;    // 分片输出中是否到达一帧结尾
+    bool        is_extra     = false;    // 是否为编码头信息（SPS/PPS）
+    MppPacket   handle       = nullptr;  // 需由 EncoderReleasePacket 释放
 };
 
 class MppEncInstance

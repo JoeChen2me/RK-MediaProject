@@ -5,7 +5,9 @@
 #include <deque>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "rkmppdec.h"
 #include "rkrga.h"
@@ -29,8 +31,11 @@ int main()
     // 注册 SIGINT 信号处理函数，以便在按下 Ctrl+C 时能够优雅地退出程序
     std::signal(SIGINT, signal_handler);
 
+    std::cout << "[CFG] Fixed pipeline: CAMERA_IO_MODE=dmabuf, MPP_DEC_INPUT_MODE=zerocopy"
+              << std::endl;
+
     V4L2_Camera camera;
-    if (camera.camera_GlobalInit(device, 0) != 0)  // 全局初始化，设置曝光时间为 0（自动）
+    if (camera.camera_GlobalInit(device, 20) != 0)  // 全局初始化，设置曝光时间为 20ms
     {
         std::cerr << "Failed to initialize camera globally" << std::endl;
         return 1;
@@ -90,30 +95,6 @@ int main()
     std::atomic_uint64_t enc_pkt_total{0};
     std::atomic_uint64_t zlm_input_ok{0};
     std::atomic_uint64_t zlm_input_fail{0};
-    std::atomic_uint64_t extra_pkt_sent{0};
-
-    EncPacketView extra_pkt;
-    if (mpp_encoder_instance.EncoderGetExtraInfoPacket(&extra_pkt) == 0)
-    {
-        if (zlm_publisher.InputPacketChunk(extra_pkt) == 0)
-        {
-            extra_pkt_sent.fetch_add(1, std::memory_order_relaxed);
-        }
-        else
-        {
-            zlm_input_fail.fetch_add(1, std::memory_order_relaxed);
-            std::cerr << "Failed to input encoder extra info packet to ZLM" << std::endl;
-        }
-        if (mpp_encoder_instance.EncoderReleasePacket(&extra_pkt) != 0)
-        {
-            std::cerr << "Failed to release encoder extra info packet" << std::endl;
-            return 1;
-        }
-    }
-    else
-    {
-        std::cerr << "Failed to get encoder extra info packet" << std::endl;
-    }
 
     std::mutex ready_mutex;        // 保护 readyQueue 的互斥锁 相机->解码线程
     std::mutex recycle_mutex;      // 保护 recycleQueue 的互斥锁 解码线程->相机
@@ -137,8 +118,9 @@ int main()
     std::atomic_bool rga_thread_done{false};  // RGA线程退出标志  其退出后回收线程再退出
     std::atomic_bool encode_input_done{false};
     // 统计信息
-    size_t           dropped_frames      = 0;
-    constexpr size_t kMaxReadyQueueDepth = 3;  // 控制端到端延迟，超限时丢弃最旧帧
+    size_t           dropped_frames = 0;
+    constexpr size_t kMaxReadyQueueDepth =
+        resource_limits::kCameraRequestBufferCount * 0.75;  // 控制端到端延迟，超限时丢弃最旧帧
     constexpr auto kRetryBackoffSleep = std::chrono::milliseconds(2);  // 重试退避，避免短时间忙轮询
     constexpr auto kEncodeNoPacketSleep =
         std::chrono::milliseconds(30);  // 无包时退避，避免编码输出线程忙等抢占 CPU
@@ -419,8 +401,7 @@ int main()
                 size_t         rga_retry_count = 0;
                 while (!stop_requested.load())
                 {
-                    rga_output =
-                        rga_instance.FlipHorizontal(input_desc);  // 以水平翻转为例进行 RGA 处理
+                    rga_output = rga_instance.Copy(input_desc);
                     if (rga_output != nullptr)
                     {
                         break;
@@ -556,7 +537,7 @@ int main()
                 }
 
                 encode_push_failures = 0;
-                // encode_put_frame 默认为阻塞调用，返回时输入图像已可归还给调用方
+                // encode_put_frame 为阻塞式，返回时输入帧已被编码器消费，可立即回收。
                 if (rga_instance.QueueOutputToRecycle(encode_input_desc) != 0)
                 {
                     std::cerr << "Failed to recycle RGA output after encode_put_frame, fd="
@@ -572,14 +553,52 @@ int main()
     std::thread mpp_encode_output_thread(
         [&]()
         {
-            auto last_stat_tp = std::chrono::steady_clock::now();
+            auto                 last_stat_tp = std::chrono::steady_clock::now();
+            std::vector<uint8_t> pending_au;
+            int64_t              pending_dts_ms   = -1;
+            int64_t              pending_pts_ms   = -1;
+            bool                 pending_eos      = false;
+            auto                 flush_pending_au = [&]()
+            {
+                if (pending_au.empty())
+                {
+                    return;
+                }
+                EncPacketView au_view;
+                au_view.data         = pending_au.data();
+                au_view.len          = pending_au.size();
+                au_view.dts_ms       = pending_dts_ms;
+                au_view.pts_ms       = pending_pts_ms;
+                au_view.eos          = pending_eos;
+                au_view.is_partition = false;
+                au_view.is_eoi       = true;
+                au_view.is_extra     = false;
+                au_view.handle       = nullptr;
+
+                if (zlm_publisher.InputPacketChunk(au_view) == 0)
+                {
+                    zlm_input_ok.fetch_add(
+                        1, std::memory_order_relaxed);  // 以原子方式将指定值加到当前变量上
+                }
+                else
+                {
+                    zlm_input_fail.fetch_add(1, std::memory_order_relaxed);
+                    std::cerr << "Failed to input encoded AU to ZLM, len=" << au_view.len
+                              << std::endl;
+                }
+                pending_au.clear();
+                pending_dts_ms = -1;
+                pending_pts_ms = -1;
+                pending_eos    = false;
+            };
             while (true)
             {
                 const bool    stop_now   = stop_requested.load();
                 const bool    input_done = encode_input_done.load();
                 EncPacketView pkt_view;
-                const int     get_packet_ret = mpp_encoder_instance.EncoderGetPacket(&pkt_view);
-                if (get_packet_ret == mpp_enc_packet_result::kError)  // 出错
+                const int     get_packet_ret =
+                    mpp_encoder_instance.EncoderGetPacket(&pkt_view);  // 拿到一个 packet
+                if (get_packet_ret == mpp_enc_packet_result::kError)   // 出错分支
                 {
                     if (stop_now && input_done)
                     {
@@ -592,37 +611,57 @@ int main()
                 }
                 if (get_packet_ret == mpp_enc_packet_result::kNoPacket)  // 当前无输出包
                 {
+                    // 如果是因为到达 EOS 导致无包，则先 flush 掉可能积压的
+                    /// AU，再退出循环；否则继续等待包的产生。注意这里即使输入已经结束了，也可能存在编码器内部积压的
+                    /// AU 没有及时输出，所以不能直接以输入结束作为退出条件。
                     if (mpp_encoder_instance.IsPacketEOS())
                     {
+                        flush_pending_au();
                         request_stop();
                         break;
                     }
                     if (stop_now && input_done)
                     {
+                        flush_pending_au();
                         break;
                     }
+                    // 无包但未到
+                    // EOS，说明编码器内部可能还在处理输入帧，继续等待输出包的产生；
+                    // 如果一直等不到包了，则说明可能出现了问题，后续循环中会有超时统计输出。
                     std::this_thread::sleep_for(kEncodeNoPacketSleep);
                     continue;
                 }
                 if (get_packet_ret != mpp_enc_packet_result::kHasPacket)
                 {
+                    // 既不是出错也不是无包，理论上应该就是成功拿到包了，但这里加个兜底的日志输出以防万一。
                     std::cerr << "Unexpected encoder packet state: " << get_packet_ret << std::endl;
                     fatal_error.store(true);
                     request_stop();
                     break;
                 }
 
-                enc_pkt_total.fetch_add(1, std::memory_order_relaxed);
-                if (zlm_publisher.InputPacketChunk(pkt_view) == 0)
+                enc_pkt_total.fetch_add(1, std::memory_order_relaxed);  // 成功获取到包，计数器加一
+                if (pkt_view.data && pkt_view.len > 0)                  // 确保数据有效
                 {
-                    zlm_input_ok.fetch_add(1, std::memory_order_relaxed);
+                    if (pending_au.empty())  // 说明当前这个 packet 是一个新的 AU 的开始
+                    {
+                        pending_dts_ms = pkt_view.dts_ms;
+                        pending_pts_ms = pkt_view.pts_ms;
+                        pending_eos    = pkt_view.eos;
+                    }
+                    else
+                    {
+                        pending_eos = pending_eos || pkt_view.eos;
+                    }
+                    const uint8_t* packet_bytes_addr = static_cast<const uint8_t*>(pkt_view.data);
+                    pending_au.insert(
+                        pending_au.end(), packet_bytes_addr,
+                        packet_bytes_addr +
+                            pkt_view.len);  // 将当前 packet 的数据追加到 pending_au 中
                 }
-                else
-                {
-                    zlm_input_fail.fetch_add(1, std::memory_order_relaxed);
-                    std::cerr << "Failed to input encoded packet to ZLM, len=" << pkt_view.len
-                              << std::endl;
-                }
+                const bool packet_is_partition = pkt_view.is_partition;
+                const bool packet_is_eoi       = pkt_view.is_eoi;
+                const bool packet_eos          = pkt_view.eos;
                 if (mpp_encoder_instance.EncoderReleasePacket(&pkt_view) != 0)
                 {
                     std::cerr << "Failed to release encoded packet" << std::endl;
@@ -630,15 +669,21 @@ int main()
                     request_stop();
                     break;
                 }
+                const bool au_done = (!packet_is_partition) || packet_is_eoi || packet_eos;
+                if (au_done)  // 完整的AU 拿到了，送给 ZLM 推流
+                {
+                    flush_pending_au();
+                }
 
                 const auto now_tp = std::chrono::steady_clock::now();
-                if (now_tp - last_stat_tp >= std::chrono::seconds(5))
+                if (now_tp - last_stat_tp >=
+                    std::chrono::seconds(
+                        5))  // 每 5 秒输出一次统计信息，帮助观察程序运行状态和性能指标
                 {
-                    last_stat_tp = now_tp;
+                    last_stat_tp = now_tp;  // 更新上次输出统计的时间点
                     std::cout << "[ENC->ZLM] enc_pkt_total=" << enc_pkt_total.load()
                               << ", zlm_input_ok=" << zlm_input_ok.load()
                               << ", zlm_input_fail=" << zlm_input_fail.load()
-                              << ", extra_pkt_sent=" << extra_pkt_sent.load()
                               << ", zlm_frame_out=" << zlm_publisher.GetOutputFrameCount()
                               << ", ts_fallback=" << zlm_publisher.GetTimestampFallbackCount()
                               << std::endl;

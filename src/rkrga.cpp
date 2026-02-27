@@ -17,11 +17,45 @@ namespace
 {
 constexpr int kRgaFormatNv12 = RK_FORMAT_YCbCr_420_SP;
 
+bool MapMppToRgaFormat(uint32_t mpp_fmt, int* out_rga_fmt)
+{
+    if (!out_rga_fmt)
+    {
+        return false;
+    }
+
+    const uint32_t base_fmt = (mpp_fmt & MPP_FRAME_FMT_MASK);
+    switch (base_fmt)
+    {
+        case MPP_FMT_YUV420SP:
+            *out_rga_fmt = RK_FORMAT_YCbCr_420_SP;  // NV12
+            return true;
+        case MPP_FMT_YUV420SP_VU:
+            *out_rga_fmt = RK_FORMAT_YCrCb_420_SP;  // NV21
+            return true;
+        case MPP_FMT_YUV422SP:
+            *out_rga_fmt = RK_FORMAT_YCbCr_422_SP;  // NV16
+            return true;
+        case MPP_FMT_YUV422SP_VU:
+            *out_rga_fmt = RK_FORMAT_YCrCb_422_SP;  // NV61
+            return true;
+        case MPP_FMT_YUV420P:
+            *out_rga_fmt = RK_FORMAT_YCbCr_420_P;  // I420
+            return true;
+        case MPP_FMT_YUV422P:
+            *out_rga_fmt = RK_FORMAT_YCbCr_422_P;
+            return true;
+        default:
+            return false;
+    }
+}
+
 // 注意：这里的 h_stride / v_stride 是沿用本模块历史命名：
 // h_stride -> librga 的 wstride（水平步幅，像素）
 // v_stride -> librga 的 hstride（垂直步幅，像素）
 int BuildRgaBuffer(const IO_FD_t* buffer, uint32_t width, uint32_t height, uint32_t h_stride,
-                   uint32_t v_stride, rga_buffer_t* out, rga_buffer_handle_t* handle)
+                   uint32_t v_stride, int rga_format, rga_buffer_t* out,
+                   rga_buffer_handle_t* handle)
 {
     if (!buffer || !out || !handle || width == 0 || height == 0 || h_stride == 0 || v_stride == 0)
     {
@@ -35,7 +69,7 @@ int BuildRgaBuffer(const IO_FD_t* buffer, uint32_t width, uint32_t height, uint3
         if (*handle)
         {
             *out = wrapbuffer_handle(*handle, static_cast<int>(width), static_cast<int>(height),
-                                     kRgaFormatNv12, static_cast<int>(h_stride),
+                                     rga_format, static_cast<int>(h_stride),
                                      static_cast<int>(v_stride));
             return 0;
         }
@@ -45,7 +79,7 @@ int BuildRgaBuffer(const IO_FD_t* buffer, uint32_t width, uint32_t height, uint3
     {
         *out = wrapbuffer_virtualaddr_t(buffer->base, static_cast<int>(width),
                                         static_cast<int>(height), static_cast<int>(h_stride),
-                                        static_cast<int>(v_stride), kRgaFormatNv12);
+                                        static_cast<int>(v_stride), rga_format);
         return 0;
     }
 
@@ -69,6 +103,7 @@ RgaInstance::RgaInstance()
         item.fd         = -1;
         item.base       = nullptr;
         item.size       = 0;
+        item.format     = 0;
         item.width      = 0;
         item.height     = 0;
         item.hor_stride = 0;
@@ -133,6 +168,7 @@ int RgaInstance::AllocDmaBufFD(IO_FD_t* output, size_t size)
     output->fd         = req.fd;
     output->base       = mapped_base;
     output->size       = size;
+    output->format     = 0;
     output->width      = 0;
     output->height     = 0;
     output->hor_stride = 0;
@@ -158,6 +194,7 @@ void RgaInstance::ReleaseDmaBufFD(IO_FD_t* output)
         output->fd = -1;
     }
     output->size       = 0;
+    output->format     = 0;
     output->width      = 0;
     output->height     = 0;
     output->hor_stride = 0;
@@ -185,8 +222,16 @@ bool RgaInstance::LoadConfigFromIO(const IO_FD_t* io, ImageConfig* cfg) const
     // 历史命名映射：h_stride 保存水平步幅（wstride）。
     cfg->h_stride = io->hor_stride;
     // 历史命名映射：v_stride 保存垂直步幅（hstride）。
-    cfg->v_stride = io->ver_stride;
-    cfg->valid    = true;
+    cfg->v_stride         = io->ver_stride;
+    cfg->format           = (io->format != 0 ? (io->format & MPP_FRAME_FMT_MASK)
+                                             : static_cast<uint32_t>(MPP_FMT_YUV420SP));
+    int source_rga_format = 0;
+    if (!MapMppToRgaFormat(cfg->format, &source_rga_format))
+    {
+        std::cerr << "Unsupported source MPP format for RGA: " << cfg->format << std::endl;
+        return false;
+    }
+    cfg->valid = true;
     return true;
 }
 
@@ -282,6 +327,7 @@ int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
         out.height     = src_cfg.height;
         out.hor_stride = src_cfg.h_stride;
         out.ver_stride = src_cfg.v_stride;
+        out.format     = MPP_FMT_YUV420SP;  // RGA 输出统一为 NV12 给编码器消费
     }
 
     output_pool_ready_ = true;
@@ -393,6 +439,23 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
         return nullptr;
     }
 
+    int src_rga_format = 0;
+    if (!MapMppToRgaFormat(src_cfg.format, &src_rga_format))
+    {
+        (void)QueueOutputToRecycle(dst);
+        std::cerr << "Unsupported source format for RGA transform: " << src_cfg.format << std::endl;
+        return nullptr;
+    }
+    static bool logged_src_fmt = false;
+    if (!logged_src_fmt)
+    {
+        logged_src_fmt = true;
+        std::cerr << "[RGA] first src fmt=" << src_cfg.format << " mapped=" << src_rga_format
+                  << ", w=" << src_cfg.width << ", h=" << src_cfg.height
+                  << ", hs=" << src_cfg.h_stride << ", vs=" << src_cfg.v_stride
+                  << ", dst_fmt=" << kRgaFormatNv12 << std::endl;
+    }
+
     rga_buffer_t        src_buffer{};
     rga_buffer_t        dst_buffer{};
     rga_buffer_handle_t src_handle            = 0;
@@ -400,7 +463,7 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
     auto                recycle_dst_if_needed = [&]() { (void)QueueOutputToRecycle(dst); };
 
     if (BuildRgaBuffer(src, src_cfg.width, src_cfg.height, src_cfg.h_stride, src_cfg.v_stride,
-                       &src_buffer, &src_handle) != 0)
+                       src_rga_format, &src_buffer, &src_handle) != 0)
     {
         recycle_dst_if_needed();
         std::cerr << "Failed to build RGA source buffer" << std::endl;
@@ -408,7 +471,7 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
     }
 
     if (BuildRgaBuffer(dst, src_cfg.width, src_cfg.height, src_cfg.h_stride, src_cfg.v_stride,
-                       &dst_buffer, &dst_handle) != 0)
+                       kRgaFormatNv12, &dst_buffer, &dst_handle) != 0)
     {
         ReleaseRgaHandle(src_handle);
         recycle_dst_if_needed();
@@ -416,17 +479,34 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
         return nullptr;
     }
 
-    IM_STATUS status = IM_STATUS_FAILED;
+    const bool need_color_convert = (src_rga_format != kRgaFormatNv12);
+    IM_STATUS  status             = IM_STATUS_FAILED;
     switch (op)
     {
         case Operation::kCopy:
-            status = imcopy(src_buffer, dst_buffer);
+            status = need_color_convert
+                         ? imcvtcolor(src_buffer, dst_buffer, src_rga_format, kRgaFormatNv12)
+                         : imcopy(src_buffer, dst_buffer);
             break;
         case Operation::kFlipHorizontal:
-            status = imflip(src_buffer, dst_buffer, IM_HAL_TRANSFORM_FLIP_H);
+            if (need_color_convert)
+            {
+                status = IM_STATUS_NOT_SUPPORTED;
+            }
+            else
+            {
+                status = imflip(src_buffer, dst_buffer, IM_HAL_TRANSFORM_FLIP_H);
+            }
             break;
         case Operation::kFlipVertical:
-            status = imflip(src_buffer, dst_buffer, IM_HAL_TRANSFORM_FLIP_V);
+            if (need_color_convert)
+            {
+                status = IM_STATUS_NOT_SUPPORTED;
+            }
+            else
+            {
+                status = imflip(src_buffer, dst_buffer, IM_HAL_TRANSFORM_FLIP_V);
+            }
             break;
         default:
             status = IM_STATUS_FAILED;

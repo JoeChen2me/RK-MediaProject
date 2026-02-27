@@ -1,6 +1,8 @@
 #include "v4l2Camera.h"
 
 #include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-heap.h>
 #include <linux/videodev2.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -11,6 +13,67 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+
+namespace
+{
+constexpr const char* kCameraDmaHeapPath = "/dev/dma_heap/system";
+
+int alloc_dma_buf_fd(size_t size, int* out_fd, void** out_base)
+{
+    if (!out_fd || !out_base || size == 0)
+    {
+        return -1;
+    }
+
+    int heap_fd = open(kCameraDmaHeapPath, O_RDWR | O_CLOEXEC);
+    if (heap_fd < 0)
+    {
+        std::cerr << "Failed to open dma heap " << kCameraDmaHeapPath << ": "
+                  << std::strerror(errno) << std::endl;
+        return -1;
+    }
+
+    dma_heap_allocation_data req{};
+    req.len      = size;
+    req.fd_flags = O_RDWR | O_CLOEXEC;
+    if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &req) < 0)
+    {
+        std::cerr << "Failed to allocate dma-buf from heap: " << std::strerror(errno) << std::endl;
+        close(heap_fd);
+        return -1;
+    }
+    close(heap_fd);
+
+    void* mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, req.fd, 0);
+    if (mapped == MAP_FAILED)
+    {
+        std::cerr << "Failed to mmap dma-buf fd=" << req.fd << ": " << std::strerror(errno)
+                  << std::endl;
+        close(req.fd);
+        return -1;
+    }
+
+    *out_fd   = req.fd;
+    *out_base = mapped;
+    return 0;
+}
+
+bool dma_buf_sync_read(int fd, bool is_start)
+{
+    if (fd < 0)
+    {
+        return false;
+    }
+
+    dma_buf_sync sync{};
+    sync.flags = (is_start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | DMA_BUF_SYNC_READ;
+    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0)
+    {
+        return false;
+    }
+    return true;
+}
+}  // namespace
 
 V4L2_Camera::V4L2_Camera()
 {
@@ -268,7 +331,8 @@ int V4L2_Camera::check_cameraCapabilities()
     }
     // 二次确认：S_FMT 后立即 G_FMT，读取驱动最终生效配置。
     {
-        struct v4l2_format fmt_get{};
+        struct v4l2_format fmt_get
+        {};
         fmt_get.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (ioctl(camera_fd, VIDIOC_G_FMT, &fmt_get) < 0)
         {
@@ -333,7 +397,8 @@ int V4L2_Camera::check_cameraCapabilities()
     }
     // 二次确认：S_PARM 后立即 G_PARM，读取驱动最终生效帧率。
     {
-        struct v4l2_streamparm parm_get{};
+        struct v4l2_streamparm parm_get
+        {};
         parm_get.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (ioctl(camera_fd, VIDIOC_G_PARM, &parm_get) < 0)
         {
@@ -558,21 +623,25 @@ int V4L2_Camera::init_camera_buffer()
     CurrentFrameDesc = nullptr;
     for (auto& frame_desc : FrameDescArray)
     {
-        frame_desc.index       = -1;
-        frame_desc.fd          = -1;
-        frame_desc.base        = nullptr;
-        frame_desc.Length      = 0;
-        frame_desc.payloadSize = 0;
+        frame_desc.index             = -1;
+        frame_desc.fd                = -1;
+        frame_desc.base              = nullptr;
+        frame_desc.Length            = 0;
+        frame_desc.payloadSize       = 0;
+        frame_desc.cpuSyncReadActive = false;
     }
 
     // 请求缓冲区
-    struct v4l2_requestbuffers reqbuf{};
-    reqbuf.count  = camera_params::kRequestBufferCount;  // 请求缓冲区数量
-    reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;         // 视频捕获类型
-    reqbuf.memory = V4L2_MEMORY_MMAP;                    // 使用内存映射方式
-    if (ioctl(camera_fd, VIDIOC_REQBUFS, &reqbuf) < 0)   // 请求缓冲区
+    struct v4l2_requestbuffers reqbuf
+    {};
+    const __u32 requested_count = camera_params::kRequestBufferCount;
+    reqbuf.count                = requested_count;
+    reqbuf.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    reqbuf.memory               = V4L2_MEMORY_DMABUF;
+    if (ioctl(camera_fd, VIDIOC_REQBUFS, &reqbuf) < 0)
     {
-        std::cerr << "Failed to request buffers: " << std::strerror(errno) << std::endl;
+        std::cerr << "Failed to request DMABUF capture buffers: " << std::strerror(errno)
+                  << std::endl;
         return -1;
     }
     if (reqbuf.count == 0)
@@ -586,57 +655,42 @@ int V4L2_Camera::init_camera_buffer()
                   << ", max supported: " << camera_params::kMaxMappedBuffers << std::endl;
         return -1;
     }
+    std::cout << "[V4L2] IO mode: dmabuf-pool" << std::endl;
+    std::cout << "[V4L2] Buffer request: requested=" << requested_count
+              << ", granted=" << reqbuf.count << std::endl;
 
-    // 按驱动返回的 count 有界遍历，避免把异常当成正常结束
+    // DMABUF 自建池：用户分配缓冲，驱动按 index 使用这些 fd
+    const size_t alloc_size = (ActiveConfig.sizeimage > 0)
+                                  ? static_cast<size_t>(ActiveConfig.sizeimage)
+                                  : camera_params::kMaxFrameSize;
     for (__u32 i = 0; i < reqbuf.count; ++i)
     {
-        struct v4l2_buffer buffer{};
-        buffer.index  = i;
-        buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buffer.memory = V4L2_MEMORY_MMAP;
-
-        if (ioctl(camera_fd, VIDIOC_QUERYBUF, &buffer) < 0)
+        int   dma_fd   = -1;
+        void* dma_base = nullptr;
+        if (alloc_dma_buf_fd(alloc_size, &dma_fd, &dma_base) != 0)
         {
-            std::cerr << "Failed to query buffer " << i << ": " << std::strerror(errno)
-                      << std::endl;
+            std::cerr << "Failed to allocate DMABUF for camera pool, index=" << i << std::endl;
             deinit_camera_buffer();
             return -1;
         }
 
-        void* buffer_start = mmap(nullptr, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED,
-                                  camera_fd, buffer.m.offset);
-        if (buffer_start == MAP_FAILED)
-        {
-            std::cerr << "Failed to mmap buffer " << i << ": " << std::strerror(errno) << std::endl;
-            deinit_camera_buffer();
-            return -1;
-        }
-        struct v4l2_exportbuffer expbuf{};
-        expbuf.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;        // 视频捕获类型
-        expbuf.index = i;                                  // 指定要导出的缓冲区索引
-        if (ioctl(camera_fd, VIDIOC_EXPBUF, &expbuf) < 0)  // 导出缓冲区以获取文件描述符
-        {
-            std::cerr << "Failed to export buffer " << i << ": " << std::strerror(errno)
-                      << std::endl;
-            munmap(buffer_start, buffer.length);
-            deinit_camera_buffer();
-            return -1;
-        }
-        FrameDescArray[i].index  = static_cast<int>(i);  // 保存缓冲区索引
-        FrameDescArray[i].fd     = expbuf.fd;            // 保存导出的文件描述符
-        FrameDescArray[i].base   = buffer_start;         // 保存映射后的基地址
-        FrameDescArray[i].Length = buffer.length;        // 保存缓冲区长度
-
+        FrameDescArray[i].index  = static_cast<int>(i);
+        FrameDescArray[i].fd     = dma_fd;
+        FrameDescArray[i].base   = dma_base;
+        FrameDescArray[i].Length = alloc_size;
         this->NumBuffers++;
     }
 
     // 将所有缓冲区入队，准备开始捕获
     for (int i = 0; i < this->NumBuffers; i++)
     {
-        struct v4l2_buffer buffer{};
+        struct v4l2_buffer buffer
+        {};
         buffer.index  = static_cast<__u32>(i);
         buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buffer.memory = V4L2_MEMORY_MMAP;
+        buffer.memory = V4L2_MEMORY_DMABUF;
+        buffer.m.fd   = FrameDescArray[i].fd;
+        buffer.length = static_cast<__u32>(FrameDescArray[i].Length);
 
         if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)
         {
@@ -659,6 +713,17 @@ int V4L2_Camera::deinit_camera_buffer()
     int ret = 0;
     for (int i = 0; i < this->NumBuffers; i++)
     {
+        if (FrameDescArray[i].cpuSyncReadActive && FrameDescArray[i].fd >= 0)
+        {
+            if (!dma_buf_sync_read(FrameDescArray[i].fd, false))
+            {
+                std::cerr << "Failed to end dma-buf cpu read sync for buffer " << i << ": "
+                          << std::strerror(errno) << std::endl;
+                ret = -1;
+            }
+            FrameDescArray[i].cpuSyncReadActive = false;
+        }
+
         // 先解除用户态映射
         if (FrameDescArray[i].base != nullptr && FrameDescArray[i].Length > 0)
         {
@@ -687,10 +752,11 @@ int V4L2_Camera::deinit_camera_buffer()
         FrameDescArray[i].index = -1;
     }
 
-    struct v4l2_requestbuffers reqbuf{};
+    struct v4l2_requestbuffers reqbuf
+    {};
     reqbuf.count  = 0;  // 释放驱动侧分配的全部缓冲区
     reqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    reqbuf.memory = V4L2_MEMORY_MMAP;
+    reqbuf.memory = V4L2_MEMORY_DMABUF;
     if (ioctl(camera_fd, VIDIOC_REQBUFS, &reqbuf) < 0)
     {
         std::cerr << "Failed to release V4L2 buffers: " << std::strerror(errno) << std::endl;
@@ -801,7 +867,8 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
     bufferSize = 0;
 
     // 使用 poll 来实现非阻塞等待，避免直接调用 DQBUF 可能导致的长时间阻塞
-    struct pollfd pfd{};
+    struct pollfd pfd
+    {};
     pfd.fd             = camera_fd;
     pfd.events         = POLLIN | POLLPRI;  // 等待可读事件
     const int poll_ret = poll(&pfd, 1, camera_params::kDequeueTimeoutMs);
@@ -837,9 +904,10 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
      * 在确认有可读事件后，安全地调用 DQBUF 来获取帧数据。即使在极少数情况下 poll 可能误报，但 DQBUF
      * 的错误处理也足够健壮，可以通过 errno 判断是否需要重试或处理错误。
      */
-    struct v4l2_buffer buffer{};
+    struct v4l2_buffer buffer
+    {};
     buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;      // 视频捕获类型
-    buffer.memory = V4L2_MEMORY_MMAP;                 // 使用内存映射
+    buffer.memory = V4L2_MEMORY_DMABUF;               // 固定使用 DMABUF
     if (ioctl(camera_fd, VIDIOC_DQBUF, &buffer) < 0)  // 从内核队列中取出一帧数据
     {
         if (errno == EINTR || errno == EAGAIN)
@@ -854,11 +922,32 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
         std::cerr << "Invalid buffer index dequeued: " << buffer.index << std::endl;
         return camera_read_result::kFatal;
     }
+
+    FrameDesc& frame_desc = FrameDescArray[buffer.index];
+    if (!dma_buf_sync_read(frame_desc.fd, true))
+    {
+        std::cerr << "Failed to start dma-buf cpu read sync for buffer " << buffer.index << ": "
+                  << std::strerror(errno) << std::endl;
+        return camera_read_result::kFatal;
+    }
+    frame_desc.cpuSyncReadActive = true;
+
     bufferSize = buffer.bytesused;
     if (buffer.bytesused > maxBufferSize)
     {
         std::cerr << "Buffer size exceeds max allowed size: " << buffer.bytesused << " > "
                   << maxBufferSize << std::endl;
+
+        if (frame_desc.cpuSyncReadActive)
+        {
+            if (!dma_buf_sync_read(frame_desc.fd, false))
+            {
+                std::cerr << "Failed to end dma-buf cpu read sync for oversized buffer "
+                          << buffer.index << ": " << std::strerror(errno) << std::endl;
+            }
+            frame_desc.cpuSyncReadActive = false;
+        }
+
         if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
         {
             std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;
@@ -886,10 +975,24 @@ int V4L2_Camera::requeue_buffer(FrameDesc* frame_desc)
     }
     const auto buf_idx = static_cast<unsigned int>(idx);
 
-    struct v4l2_buffer buffer{};
+    if (frame_desc->cpuSyncReadActive)
+    {
+        if (!dma_buf_sync_read(frame_desc->fd, false))
+        {
+            std::cerr << "Failed to end dma-buf cpu read sync for buffer " << buf_idx << ": "
+                      << std::strerror(errno) << std::endl;
+            return -1;
+        }
+        frame_desc->cpuSyncReadActive = false;
+    }
+
+    struct v4l2_buffer buffer
+    {};
     buffer.index  = buf_idx;
-    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;     // 视频捕获类型
-    buffer.memory = V4L2_MEMORY_MMAP;                // 使用内存映射
+    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;  // 视频捕获类型
+    buffer.memory = V4L2_MEMORY_DMABUF;           // 固定使用 DMABUF
+    buffer.m.fd   = FrameDescArray[buf_idx].fd;
+    buffer.length = static_cast<__u32>(FrameDescArray[buf_idx].Length);
     if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)  // 将帧重新入队
     {
         std::cerr << "Failed to requeue buffer: " << std::strerror(errno) << std::endl;

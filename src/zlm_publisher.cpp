@@ -1,6 +1,5 @@
 #include "zlm_publisher.h"
 
-#include <cstring>
 #include <limits>
 
 namespace
@@ -54,76 +53,64 @@ int ZlmPublisher::Init()
     mk_media_init_complete(Media_);
     mk_track_unref(track);
 
-    Splitter_ = mk_h264_splitter_create(OnH264Frame, this, 0);
-    if (!Splitter_)
-    {
-        Close();
-        return -1;
-    }
-
     Initialized_ = true;
     return 0;
 }
 
 int ZlmPublisher::InputPacketChunk(const EncPacketView& pkt)
 {
-    try
-    {
-        if (!Initialized_ || !Splitter_)
-        {
-            return -1;
-        }
-        if (!pkt.data || pkt.len == 0)
-        {
-            return -1;
-        }
-        if (pkt.len > static_cast<size_t>(std::numeric_limits<int>::max()))
-        {
-            return -1;
-        }
-
-        const uint8_t* bytes          = static_cast<const uint8_t*>(pkt.data);
-        const bool     has_start_code = IsAnnexBStartCode(bytes, pkt.len);
-        if (!has_start_code && (pkt.is_extra || !HasFedAnyChunk_))
-        {
-            return -1;
-        }
-
-        if (!pkt.is_extra)
-        {
-            uint64_t dts_ms = 0;
-            uint64_t pts_ms = 0;
-            if (!NormalizeTimestamp(pkt, &dts_ms, &pts_ms))
-            {
-                return -1;
-            }
-            if (TimestampQueue_.empty() || TimestampQueue_.back().dts_ms != dts_ms ||
-                TimestampQueue_.back().pts_ms != pts_ms)
-            {
-                TimestampQueue_.push_back(TimestampNode{dts_ms, pts_ms});
-            }
-        }
-
-        Scratch_.resize(pkt.len + 1);
-        std::memcpy(Scratch_.data(), pkt.data, pkt.len);
-        Scratch_[pkt.len] = '\0';
-        mk_h264_splitter_input_data(Splitter_, Scratch_.data(), static_cast<int>(pkt.len));
-        HasFedAnyChunk_ = true;
-        return 0;
-    }
-    catch (...)
+    if (!Initialized_ || !Media_)
     {
         return -1;
     }
+    if (!pkt.data || pkt.len == 0)
+    {
+        return -1;
+    }
+    if (pkt.len > static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+        return -1;
+    }
+
+    const uint8_t* bytes = static_cast<const uint8_t*>(pkt.data);
+    if (!IsAnnexBStartCode(bytes, pkt.len))
+    {
+        return -1;
+    }
+
+    uint64_t dts_ms = 0;
+    uint64_t pts_ms = 0;
+    if (!NormalizeTimestamp(pkt, &dts_ms, &pts_ms))
+    {
+        return -1;
+    }
+
+    std::vector<NaluRange> nalus;
+    if (!SplitAnnexBNalus(bytes, pkt.len, &nalus) || nalus.empty())
+    {
+        return -1;
+    }
+    for (const auto& nalu : nalus)
+    {
+        if (!nalu.data || nalu.len == 0 ||
+            nalu.len > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return -1;
+        }
+        const int ret =
+            mk_media_input_h264(Media_, nalu.data, static_cast<int>(nalu.len), dts_ms, pts_ms);
+        if (!ret)
+        {
+            return -1;
+        }
+    }
+
+    OutputFrameCount_++;
+    return 0;
 }
 
 void ZlmPublisher::Close()
 {
-    if (Splitter_)
-    {
-        mk_h264_splitter_release(Splitter_);
-        Splitter_ = nullptr;
-    }
     if (Media_)
     {
         mk_media_release(Media_);
@@ -132,80 +119,10 @@ void ZlmPublisher::Close()
 
     mk_stop_all_server();
 
-    TimestampQueue_.clear();
-    Scratch_.clear();
-    HasFedAnyChunk_ = false;
-    Initialized_    = false;
-}
-
-void ZlmPublisher::OnH264Frame(void* user_data, mk_h264_splitter splitter, const char* data,
-                               int size)
-{
-    (void)splitter;
-    if (!user_data)
-    {
-        return;
-    }
-    static_cast<ZlmPublisher*>(user_data)->OnH264FrameInternal(data, size);
-}
-
-void ZlmPublisher::OnH264FrameInternal(const char* data, int size)
-{
-    if (!Media_ || !data || size <= 0)
-    {
-        return;
-    }
-
-    const uint8_t* bytes     = reinterpret_cast<const uint8_t*>(data);
-    const bool     is_config = IsConfigFrame(bytes, static_cast<size_t>(size));
-    uint64_t       dts_ms    = 0;
-    uint64_t       pts_ms    = 0;
-
-    if (!is_config && !TimestampQueue_.empty())
-    {
-        const TimestampNode node = TimestampQueue_.front();
-        TimestampQueue_.pop_front();
-        dts_ms = node.dts_ms;
-        pts_ms = node.pts_ms;
-    }
-    else if (!is_config)
-    {
-        if (HasLastTimestamp_)
-        {
-            dts_ms = LastDtsMs_ + FrameIntervalMs_;
-            pts_ms = dts_ms;
-        }
-        TimestampFallbackCount_++;
-    }
-    else
-    {
-        if (HasLastTimestamp_)
-        {
-            dts_ms = LastDtsMs_;
-            pts_ms = LastPtsMs_;
-        }
-    }
-
-    if (!is_config)
-    {
-        LastDtsMs_        = dts_ms;
-        LastPtsMs_        = pts_ms;
-        HasLastTimestamp_ = true;
-    }
-
-    mk_frame frame = mk_frame_create(MKCodecH264, dts_ms, pts_ms, data, static_cast<size_t>(size),
-                                     nullptr, nullptr);
-    if (!frame)
-    {
-        return;
-    }
-
-    const int ret = mk_media_input_frame(Media_, frame);
-    mk_frame_unref(frame);
-    if (ret)
-    {
-        OutputFrameCount_++;
-    }
+    LastDtsMs_        = 0;
+    LastPtsMs_        = 0;
+    HasLastTimestamp_ = false;
+    Initialized_      = false;
 }
 
 bool ZlmPublisher::NormalizeTimestamp(const EncPacketView& pkt, uint64_t* out_dts_ms,
@@ -216,53 +133,58 @@ bool ZlmPublisher::NormalizeTimestamp(const EncPacketView& pkt, uint64_t* out_dt
         return false;
     }
 
-    bool    fallback = false;
-    int64_t dts      = pkt.dts_ms;
-    int64_t pts      = pkt.pts_ms;
+    bool    used_fallback = false;
+    int64_t dts           = pkt.dts_ms;
+    int64_t pts           = pkt.pts_ms;
 
     if (dts < 0 && pts >= 0)
     {
-        dts      = pts;
-        fallback = true;
+        dts           = pts;
+        used_fallback = true;
     }
     if (pts < 0 && dts >= 0)
     {
-        pts      = dts;
-        fallback = true;
+        pts           = dts;
+        used_fallback = true;
     }
+
     if (dts < 0 || pts < 0)
     {
-        if (HasLastTimestamp_)
-        {
-            dts = static_cast<int64_t>(LastDtsMs_ + FrameIntervalMs_);
-            pts = dts;
-        }
-        else
+        const uint64_t step_ms = (FrameIntervalMs_ > 0 ? FrameIntervalMs_ : 1);
+        if (!HasLastTimestamp_)
         {
             dts = 0;
             pts = 0;
         }
-        fallback = true;
+        else
+        {
+            dts = static_cast<int64_t>(LastDtsMs_ + step_ms);
+            pts = dts;
+        }
+        used_fallback = true;
     }
 
     if (HasLastTimestamp_ && static_cast<uint64_t>(dts) <= LastDtsMs_)
     {
-        dts      = static_cast<int64_t>(LastDtsMs_ + 1);
-        fallback = true;
+        dts           = static_cast<int64_t>(LastDtsMs_ + 1);
+        used_fallback = true;
     }
     if (pts < dts)
     {
-        pts      = dts;
-        fallback = true;
+        pts           = dts;
+        used_fallback = true;
     }
 
-    if (fallback)
+    LastDtsMs_        = static_cast<uint64_t>(dts);
+    LastPtsMs_        = static_cast<uint64_t>(pts);
+    HasLastTimestamp_ = true;
+    if (used_fallback)
     {
         TimestampFallbackCount_++;
     }
 
-    *out_dts_ms = static_cast<uint64_t>(dts);
-    *out_pts_ms = static_cast<uint64_t>(pts);
+    *out_dts_ms = LastDtsMs_;
+    *out_pts_ms = LastPtsMs_;
     return true;
 }
 
@@ -286,27 +208,70 @@ bool ZlmPublisher::IsAnnexBStartCode(const uint8_t* data, size_t len) const
     return false;
 }
 
-bool ZlmPublisher::IsConfigFrame(const uint8_t* data, size_t len) const
+bool ZlmPublisher::FindAnnexBPrefix(const uint8_t* data, size_t len, size_t pos,
+                                    size_t* prefix_len) const
 {
-    if (!IsAnnexBStartCode(data, len))
+    if (!data || !prefix_len || pos >= len)
+    {
+        return false;
+    }
+    if (pos + 4 <= len && data[pos] == 0x00 && data[pos + 1] == 0x00 && data[pos + 2] == 0x00 &&
+        data[pos + 3] == 0x01)
+    {
+        *prefix_len = 4;
+        return true;
+    }
+    if (pos + 3 <= len && data[pos] == 0x00 && data[pos + 1] == 0x00 && data[pos + 2] == 0x01)
+    {
+        *prefix_len = 3;
+        return true;
+    }
+    return false;
+}
+
+bool ZlmPublisher::SplitAnnexBNalus(const uint8_t* data, size_t len,
+                                    std::vector<NaluRange>* out_nalus) const
+{
+    if (!data || !out_nalus || len < 3)
+    {
+        return false;
+    }
+    out_nalus->clear();
+
+    std::vector<size_t> starts;
+    starts.reserve(16);
+    for (size_t pos = 0; pos + 3 <= len;)
+    {
+        size_t prefix_len = 0;
+        if (FindAnnexBPrefix(data, len, pos, &prefix_len))
+        {
+            starts.push_back(pos);
+            pos += prefix_len;
+        }
+        else
+        {
+            ++pos;
+        }
+    }
+
+    if (starts.empty() || starts[0] != 0)
     {
         return false;
     }
 
-    size_t prefix = 0;
-    if (len >= 4 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01)
+    for (size_t i = 0; i < starts.size(); ++i)
     {
-        prefix = 4;
-    }
-    else
-    {
-        prefix = 3;
-    }
-    if (len <= prefix)
-    {
-        return false;
+        const size_t start = starts[i];
+        const size_t end   = (i + 1 < starts.size()) ? starts[i + 1] : len;
+        if (end <= start)
+        {
+            continue;
+        }
+        NaluRange nalu;
+        nalu.data = data + start;
+        nalu.len  = end - start;
+        out_nalus->push_back(nalu);
     }
 
-    const uint8_t nal_type = data[prefix] & 0x1Fu;
-    return nal_type == 7u || nal_type == 8u;
+    return !out_nalus->empty();
 }
