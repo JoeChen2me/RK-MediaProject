@@ -173,6 +173,8 @@ int RgaInstance::AllocDmaBufFD(IO_FD_t* output, size_t size)
     output->height     = 0;
     output->hor_stride = 0;
     output->ver_stride = 0;
+    output->pts_us     = -1;
+    output->dts_us     = -1;
     return 0;
 }
 
@@ -199,6 +201,8 @@ void RgaInstance::ReleaseDmaBufFD(IO_FD_t* output)
     output->height     = 0;
     output->hor_stride = 0;
     output->ver_stride = 0;
+    output->pts_us     = -1;
+    output->dts_us     = -1;
 }
 
 bool RgaInstance::IsConfigValid(const ImageConfig& cfg) const
@@ -328,6 +332,8 @@ int RgaInstance::InitOutputPoolIfNeeded(const ImageConfig& src_cfg)
         out.hor_stride = src_cfg.h_stride;
         out.ver_stride = src_cfg.v_stride;
         out.format     = MPP_FMT_YUV420SP;  // RGA 输出统一为 NV12 给编码器消费
+        out.pts_us     = -1;
+        out.dts_us     = -1;
     }
 
     output_pool_ready_ = true;
@@ -395,7 +401,9 @@ int RgaInstance::QueueOutputToRecycle(const IO_FD_t* output_desc)
     {
         return 0;  // 已归还过时保持幂等，避免重复回收导致流程误判失败
     }
-    output_pool_in_use_[out_index] = false;                                // 标记已经归还
+    output_pool_in_use_[out_index] = false;  // 标记已经归还
+    output_pool_[out_index].pts_us = -1;
+    output_pool_[out_index].dts_us = -1;
     output_pool_available_queue_.push(const_cast<IO_FD_t*>(output_desc));  // 推入可用队列
     return 0;
 }
@@ -521,6 +529,17 @@ const IO_FD_t* RgaInstance::TransformInternal(const IO_FD_t* src, Operation op)
         recycle_dst_if_needed();
         std::cerr << "RGA operation failed: " << imStrError_t(status) << std::endl;
         return nullptr;
+    }
+
+    dst->pts_us = src->pts_us;
+    dst->dts_us = src->dts_us;
+    if (dst->pts_us >= 0)
+    {
+        dst->dts_us = dst->pts_us;
+    }
+    else if (dst->dts_us >= 0)
+    {
+        dst->pts_us = dst->dts_us;
     }
 
     return dst;

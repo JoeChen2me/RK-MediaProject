@@ -15,8 +15,8 @@ void ResetPacketView(EncPacketView* pkt)
     }
     pkt->data         = nullptr;
     pkt->len          = 0;
-    pkt->dts_ms       = -1;
-    pkt->pts_ms       = -1;
+    pkt->dts_us       = -1;
+    pkt->pts_us       = -1;
     pkt->eos          = false;
     pkt->is_partition = false;
     pkt->is_eoi       = false;
@@ -390,7 +390,31 @@ int MppEncInstance::BuildInputFrameFromFd(const IO_FD_t* input_desc, MppFrame* o
     mpp_frame_set_buffer(*out_frame, inBuf->second);  // 将对应的 MppBuffer 句柄关联到 MppFrame 上
     const RK_S64 frame_id = static_cast<RK_S64>(InputFrameId++);
     const RK_S64 fps      = static_cast<RK_S64>(Fps_ > 0 ? Fps_ : kDefaultFps);
-    mpp_frame_set_pts(*out_frame, frame_id * 1000 / fps);  // 使用毫秒时间戳
+    RK_S64       pts_us   = input_desc->pts_us;
+    RK_S64       dts_us   = input_desc->dts_us;
+    if (pts_us >= 0)
+    {
+        dts_us = pts_us;
+    }
+    else if (dts_us >= 0)
+    {
+        pts_us = dts_us;
+    }
+    if (pts_us < 0 || dts_us < 0)
+    {
+        const RK_S64 step_us = (fps > 0 ? 1000000 / fps : 33333);
+        const RK_S64 base_us = frame_id * step_us;
+        if (pts_us < 0)
+        {
+            pts_us = base_us;
+        }
+        if (dts_us < 0)
+        {
+            dts_us = pts_us;
+        }
+    }
+    mpp_frame_set_pts(*out_frame, pts_us);
+    mpp_frame_set_dts(*out_frame, dts_us);
     if (isEos)
     {
         mpp_frame_set_eos(*out_frame, 1);  // 设置 EOS 标志
@@ -503,8 +527,8 @@ int MppEncInstance::EncoderGetExtraInfoPacket(EncPacketView* out)
 
     out->data        = ptr;
     out->len         = len;
-    out->dts_ms      = -1;
-    out->pts_ms      = -1;
+    out->dts_us      = -1;
+    out->pts_us      = -1;
     out->eos         = false;
     out->is_extra    = true;
     out->handle      = packet;
@@ -545,8 +569,8 @@ int MppEncInstance::EncoderGetPacket(EncPacketView* out)
 
     out->data         = ptr;
     out->len          = len;
-    out->dts_ms       = mpp_packet_get_dts(packet);
-    out->pts_ms       = mpp_packet_get_pts(packet);
+    out->dts_us       = mpp_packet_get_dts(packet);
+    out->pts_us       = mpp_packet_get_pts(packet);
     out->eos          = (mpp_packet_get_eos(packet) != 0);
     out->is_partition = (mpp_packet_is_partition(packet) != 0);
     out->is_eoi       = (mpp_packet_is_eoi(packet) != 0);

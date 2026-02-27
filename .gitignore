@@ -7,3 +7,6 @@ node_modules/
 dist/
 experiments/
 third_party/
+
+*.mp4
+*.avi

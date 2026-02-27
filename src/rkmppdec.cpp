@@ -43,6 +43,8 @@ MppDecInstance::MppDecInstance()
         fd_info.height     = 0;
         fd_info.hor_stride = 0;
         fd_info.ver_stride = 0;
+        fd_info.pts_us     = -1;
+        fd_info.dts_us     = -1;
     }
     OutBufFD2Index_Map.clear();  // 初始化映射表
     CurrentOutputDesc = nullptr;
@@ -470,6 +472,17 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
         return -1;
     }
 
+    int64_t packet_pts_us = frame_desc->pts_us;
+    int64_t packet_dts_us = frame_desc->dts_us;
+    if (packet_pts_us >= 0)
+    {
+        packet_dts_us = packet_pts_us;
+    }
+    else if (packet_dts_us >= 0)
+    {
+        packet_pts_us = packet_dts_us;
+    }
+
     bool holder_wait_logged = false;
     while (!holder)
     {
@@ -551,6 +564,8 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
         packet_local,
         const_cast<void*>(mapped_base));  // 设置当前位置指针为数据起始地址，供 MPP 内部访问
     mpp_packet_set_length(packet_local, effective_size);  // 设置数据长度为有效载荷大小
+    mpp_packet_set_pts(packet_local, packet_pts_us);
+    mpp_packet_set_dts(packet_local, packet_dts_us);
 
     ret = mpp_api->poll(mpp_ctx, MPP_PORT_INPUT, kPollTimeout500Ms);
     if (ret < 0)
@@ -693,8 +708,18 @@ int MppDecInstance::MppDecode(const FrameDesc* frame_desc)
         output_info.height     = static_cast<uint32_t>(frame_height);
         output_info.hor_stride = static_cast<uint32_t>(frame_hs);
         output_info.ver_stride = static_cast<uint32_t>(frame_vs);
-        output_desc            = &output_info;  // 取地址
-        CurrentOutputDesc      = output_desc;
+        output_info.pts_us     = mpp_frame_get_pts(decoded_frame);
+        output_info.dts_us     = mpp_frame_get_dts(decoded_frame);
+        if (output_info.pts_us >= 0)
+        {
+            output_info.dts_us = output_info.pts_us;
+        }
+        else if (output_info.dts_us >= 0)
+        {
+            output_info.pts_us = output_info.dts_us;
+        }
+        output_desc       = &output_info;  // 取地址
+        CurrentOutputDesc = output_desc;
     }
 
     // 输出任务不再延迟，先归还任务通道，避免阻塞后续解码。
@@ -853,6 +878,8 @@ int MppDecInstance::AllocDmaBufFD(IO_FD_t& output, size_t size)
     output.height     = 0;
     output.hor_stride = 0;
     output.ver_stride = 0;
+    output.pts_us     = -1;
+    output.dts_us     = -1;
     return 0;
 }
 
@@ -888,6 +915,8 @@ void MppDecInstance::ReleaseExternalOutputBuffers()
         output.height     = 0;
         output.hor_stride = 0;
         output.ver_stride = 0;
+        output.pts_us     = -1;
+        output.dts_us     = -1;
     }
     OutBufFD2Index_Map.clear();  // 清空 fd 到输出缓冲索引的映射
     CurrentOutputDesc = nullptr;

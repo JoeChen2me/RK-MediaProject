@@ -35,7 +35,7 @@ int main()
               << std::endl;
 
     V4L2_Camera camera;
-    if (camera.camera_GlobalInit(device, 20) != 0)  // 全局初始化，设置曝光时间为 20ms
+    if (camera.camera_GlobalInit(device, 0) != 0)  // 全局初始化，设置曝光时间为 20ms
     {
         std::cerr << "Failed to initialize camera globally" << std::endl;
         return 1;
@@ -91,6 +91,17 @@ int main()
         std::cerr << "Failed to initialize ZLM publisher" << std::endl;
         return 1;
     }
+    uint32_t expected_fps = 30;
+    if (active_cfg.fps_num > 0 && active_cfg.fps_den > 0)
+    {
+        expected_fps = active_cfg.fps_den / active_cfg.fps_num;
+        if (expected_fps == 0)
+        {
+            expected_fps = 30;
+        }
+    }
+    zlm_publisher.SetExpectedFps(expected_fps);
+    std::cout << "[CFG] Timestamp fallback fps=" << expected_fps << std::endl;
 
     std::atomic_uint64_t enc_pkt_total{0};
     std::atomic_uint64_t zlm_input_ok{0};
@@ -546,9 +557,13 @@ int main()
     {
         auto                 last_stat_tp = std::chrono::steady_clock::now();
         std::vector<uint8_t> pending_au;
-        int64_t              pending_dts_ms   = -1;
-        int64_t              pending_pts_ms   = -1;
+        int64_t              pending_dts_us   = -1;
+        int64_t              pending_pts_us   = -1;
         bool                 pending_eos      = false;
+        bool                 first_ts_logged  = false;
+        uint64_t             bad_pkt_ts_count = 0;
+        int64_t              last_pkt_dts_us  = -1;
+        int64_t              last_pkt_pts_us  = -1;
         auto                 flush_pending_au = [&]()
         {
             if (pending_au.empty())
@@ -558,8 +573,8 @@ int main()
             EncPacketView au_view;
             au_view.data         = pending_au.data();
             au_view.len          = pending_au.size();
-            au_view.dts_ms       = pending_dts_ms;
-            au_view.pts_ms       = pending_pts_ms;
+            au_view.dts_us       = pending_dts_us;
+            au_view.pts_us       = pending_pts_us;
             au_view.eos          = pending_eos;
             au_view.is_partition = false;
             au_view.is_eoi       = true;
@@ -577,8 +592,8 @@ int main()
                 std::cerr << "Failed to input encoded AU to ZLM, len=" << au_view.len << std::endl;
             }
             pending_au.clear();
-            pending_dts_ms = -1;
-            pending_pts_ms = -1;
+            pending_dts_us = -1;
+            pending_pts_us = -1;
             pending_eos    = false;
         };
         while (true)
@@ -631,17 +646,37 @@ int main()
             }
 
             enc_pkt_total.fetch_add(1, std::memory_order_relaxed);  // 成功获取到包，计数器加一
-            if (pkt_view.data && pkt_view.len > 0)                  // 确保数据有效
+            if (!first_ts_logged)
+            {
+                first_ts_logged = true;
+                std::cout << "[ENC->ZLM] first packet ts: dts_us=" << pkt_view.dts_us
+                          << ", pts_us=" << pkt_view.pts_us << std::endl;
+            }
+            if (pkt_view.dts_us < 0 || pkt_view.pts_us < 0)
+            {
+                bad_pkt_ts_count++;
+            }
+            last_pkt_dts_us = pkt_view.dts_us;
+            last_pkt_pts_us = pkt_view.pts_us;
+            if (pkt_view.data && pkt_view.len > 0)  // 确保数据有效
             {
                 if (pending_au.empty())  // 说明当前这个 packet 是一个新的 AU 的开始
                 {
-                    pending_dts_ms = pkt_view.dts_ms;
-                    pending_pts_ms = pkt_view.pts_ms;
+                    pending_dts_us = pkt_view.dts_us;
+                    pending_pts_us = pkt_view.pts_us;
                     pending_eos    = pkt_view.eos;
                 }
                 else
                 {
                     pending_eos = pending_eos || pkt_view.eos;
+                    if (pending_dts_us < 0 && pkt_view.dts_us >= 0)
+                    {
+                        pending_dts_us = pkt_view.dts_us;
+                    }
+                    if (pending_pts_us < 0 && pkt_view.pts_us >= 0)
+                    {
+                        pending_pts_us = pkt_view.pts_us;
+                    }
                 }
                 const uint8_t* packet_bytes_addr = static_cast<const uint8_t*>(pkt_view.data);
                 pending_au.insert(
@@ -674,7 +709,9 @@ int main()
                           << ", zlm_input_fail=" << zlm_input_fail.load()
                           << ", zlm_frame_out=" << zlm_publisher.GetOutputFrameCount()
                           << ", ts_fallback=" << zlm_publisher.GetTimestampFallbackCount()
-                          << std::endl;
+                          << ", bad_pkt_ts=" << bad_pkt_ts_count
+                          << ", last_pkt_dts_us=" << last_pkt_dts_us
+                          << ", last_pkt_pts_us=" << last_pkt_pts_us << std::endl;
             }
 
             if (mpp_encoder_instance.IsPacketEOS())

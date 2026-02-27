@@ -57,6 +57,19 @@ int ZlmPublisher::Init()
     return 0;
 }
 
+void ZlmPublisher::SetExpectedFps(uint32_t fps)
+{
+    if (fps == 0)
+    {
+        fps = 30;
+    }
+    FrameIntervalUs_ = 1000000 / static_cast<uint64_t>(fps);
+    if (FrameIntervalUs_ == 0)
+    {
+        FrameIntervalUs_ = 1;
+    }
+}
+
 int ZlmPublisher::InputPacketChunk(const EncPacketView& pkt)
 {
     if (!Initialized_ || !Media_)
@@ -119,6 +132,8 @@ void ZlmPublisher::Close()
 
     mk_stop_all_server();
 
+    LastDtsUs_        = 0;
+    LastPtsUs_        = 0;
     LastDtsMs_        = 0;
     LastPtsMs_        = 0;
     HasLastTimestamp_ = false;
@@ -134,49 +149,64 @@ bool ZlmPublisher::NormalizeTimestamp(const EncPacketView& pkt, uint64_t* out_dt
     }
 
     bool    used_fallback = false;
-    int64_t dts           = pkt.dts_ms;
-    int64_t pts           = pkt.pts_ms;
+    int64_t dts_us        = pkt.dts_us;
+    int64_t pts_us        = pkt.pts_us;
 
-    if (dts < 0 && pts >= 0)
+    if (dts_us < 0 && pts_us >= 0)
     {
-        dts           = pts;
+        dts_us        = pts_us;
         used_fallback = true;
     }
-    if (pts < 0 && dts >= 0)
+    if (pts_us < 0 && dts_us >= 0)
     {
-        pts           = dts;
+        pts_us        = dts_us;
         used_fallback = true;
     }
 
-    if (dts < 0 || pts < 0)
+    if (dts_us < 0 || pts_us < 0)
     {
-        const uint64_t step_ms = (FrameIntervalMs_ > 0 ? FrameIntervalMs_ : 1);
+        const uint64_t step_us = (FrameIntervalUs_ > 0 ? FrameIntervalUs_ : 1);
         if (!HasLastTimestamp_)
         {
-            dts = 0;
-            pts = 0;
+            dts_us = 0;
+            pts_us = 0;
         }
         else
         {
-            dts = static_cast<int64_t>(LastDtsMs_ + step_ms);
-            pts = dts;
+            dts_us = static_cast<int64_t>(LastDtsUs_ + step_us);
+            pts_us = dts_us;
         }
         used_fallback = true;
     }
 
-    if (HasLastTimestamp_ && static_cast<uint64_t>(dts) <= LastDtsMs_)
+    if (HasLastTimestamp_ && static_cast<uint64_t>(dts_us) <= LastDtsUs_)
     {
-        dts           = static_cast<int64_t>(LastDtsMs_ + 1);
+        dts_us        = static_cast<int64_t>(LastDtsUs_ + 1);
         used_fallback = true;
     }
-    if (pts < dts)
+    if (pts_us < dts_us)
     {
-        pts           = dts;
+        pts_us        = dts_us;
         used_fallback = true;
     }
 
-    LastDtsMs_        = static_cast<uint64_t>(dts);
-    LastPtsMs_        = static_cast<uint64_t>(pts);
+    uint64_t dts_ms = static_cast<uint64_t>(dts_us / 1000);
+    uint64_t pts_ms = static_cast<uint64_t>(pts_us / 1000);
+    if (HasLastTimestamp_ && dts_ms <= LastDtsMs_)
+    {
+        dts_ms        = LastDtsMs_ + 1;
+        used_fallback = true;
+    }
+    if (pts_ms < dts_ms)
+    {
+        pts_ms        = dts_ms;
+        used_fallback = true;
+    }
+
+    LastDtsUs_        = static_cast<uint64_t>(dts_us);
+    LastPtsUs_        = static_cast<uint64_t>(pts_us);
+    LastDtsMs_        = dts_ms;
+    LastPtsMs_        = pts_ms;
     HasLastTimestamp_ = true;
     if (used_fallback)
     {

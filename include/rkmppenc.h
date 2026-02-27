@@ -35,8 +35,8 @@ struct EncPacketView
 {
     const void* data         = nullptr;  // 当前 packet 数据指针
     size_t      len          = 0;        // 当前 packet 长度
-    int64_t     dts_ms       = -1;       // packet dts（毫秒）
-    int64_t     pts_ms       = -1;       // packet pts（毫秒）
+    int64_t     dts_us       = -1;       // packet dts（微秒）
+    int64_t     pts_us       = -1;       // packet pts（微秒）
     bool        eos          = false;    // packet 是否带 EOS
     bool        is_partition = false;    // packet 是否为分片输出
     bool        is_eoi       = false;    // 分片输出中是否到达一帧结尾

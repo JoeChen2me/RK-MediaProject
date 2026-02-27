@@ -7,11 +7,13 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cmath>
 #include <cerrno>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 
 namespace
@@ -72,6 +74,21 @@ bool dma_buf_sync_read(int fd, bool is_start)
         return false;
     }
     return true;
+}
+
+int64_t get_monotonic_time_us()
+{
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    {
+        return -1;
+    }
+    return static_cast<int64_t>(ts.tv_sec) * 1000000 + static_cast<int64_t>(ts.tv_nsec / 1000);
+}
+
+int64_t timeval_to_us(const timeval& tv)
+{
+    return static_cast<int64_t>(tv.tv_sec) * 1000000 + static_cast<int64_t>(tv.tv_usec);
 }
 }  // namespace
 
@@ -628,6 +645,8 @@ int V4L2_Camera::init_camera_buffer()
         frame_desc.base              = nullptr;
         frame_desc.Length            = 0;
         frame_desc.payloadSize       = 0;
+        frame_desc.pts_us            = -1;
+        frame_desc.dts_us            = -1;
         frame_desc.cpuSyncReadActive = false;
     }
 
@@ -739,6 +758,8 @@ int V4L2_Camera::deinit_camera_buffer()
             FrameDescArray[i].base        = nullptr;
             FrameDescArray[i].Length      = 0;
             FrameDescArray[i].payloadSize = 0;
+            FrameDescArray[i].pts_us      = -1;
+            FrameDescArray[i].dts_us      = -1;
         }
 
         // 再关闭导出的 dma-buf 文件描述符
@@ -752,7 +773,9 @@ int V4L2_Camera::deinit_camera_buffer()
             }
             FrameDescArray[i].fd = -1;
         }
-        FrameDescArray[i].index = -1;
+        FrameDescArray[i].index  = -1;
+        FrameDescArray[i].pts_us = -1;
+        FrameDescArray[i].dts_us = -1;
     }
 
     struct v4l2_requestbuffers reqbuf
@@ -928,7 +951,17 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
         return camera_read_result::kFatal;
     }
 
-    FrameDesc& frame_desc = FrameDescArray[buffer.index];
+    FrameDesc& frame_desc  = FrameDescArray[buffer.index];
+    int64_t    frame_ts_us = timeval_to_us(buffer.timestamp);
+    if (frame_ts_us <= 0)
+    {
+        frame_ts_us = get_monotonic_time_us();
+    }
+    if (frame_ts_us <= 0)
+    {
+        frame_ts_us = 0;
+    }
+
     if (!dma_buf_sync_read(frame_desc.fd, true))
     {
         std::cerr << "Failed to start dma-buf cpu read sync for buffer " << buffer.index << ": "
@@ -937,7 +970,9 @@ int V4L2_Camera::dequeue_buffer(unsigned int& BufIdx, unsigned int& bufferSize,
     }
     frame_desc.cpuSyncReadActive = true;
 
-    bufferSize = buffer.bytesused;
+    bufferSize        = buffer.bytesused;
+    frame_desc.pts_us = frame_ts_us;
+    frame_desc.dts_us = frame_ts_us;
     if (buffer.bytesused > maxBufferSize)
     {
         std::cerr << "Buffer size exceeds max allowed size: " << buffer.bytesused << " > "
@@ -1005,7 +1040,11 @@ int V4L2_Camera::requeue_buffer(FrameDesc* frame_desc)
     }
 
     frame_desc->payloadSize             = 0;
+    frame_desc->pts_us                  = -1;
+    frame_desc->dts_us                  = -1;
     FrameDescArray[buf_idx].payloadSize = 0;
+    FrameDescArray[buf_idx].pts_us      = -1;
+    FrameDescArray[buf_idx].dts_us      = -1;
     if (CurrentFrameDesc == frame_desc || CurrentFrameDesc == &FrameDescArray[buf_idx])
     {
         CurrentFrameDesc = nullptr;

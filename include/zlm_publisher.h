@@ -14,6 +14,7 @@ class ZlmPublisher
     ~ZlmPublisher();
 
     int      Init();
+    void     SetExpectedFps(uint32_t fps);
     int      InputPacketChunk(const EncPacketView& pkt);
     void     Close();
     uint64_t GetOutputFrameCount() const { return OutputFrameCount_; }
@@ -33,11 +34,13 @@ class ZlmPublisher
 
     mk_media Media_ = nullptr;
 
+    uint64_t LastDtsUs_              = 0;
+    uint64_t LastPtsUs_              = 0;
     uint64_t LastDtsMs_              = 0;
     uint64_t LastPtsMs_              = 0;
     uint64_t OutputFrameCount_       = 0;
     uint64_t TimestampFallbackCount_ = 0;
-    uint64_t FrameIntervalMs_        = 1000 / 30;
+    uint64_t FrameIntervalUs_        = 1000000 / 30;
     bool     Initialized_            = false;
     bool     HasLastTimestamp_       = false;
 };

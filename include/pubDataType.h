@@ -20,12 +20,14 @@ inline constexpr size_t kRgaOutputBufferCount     = kMaxAllocaSize;
 // 用于在相机和 MPP 之间传递帧缓冲描述信息，包含必要的 fd、尺寸和有效载荷大小等字段。
 struct FrameDesc
 {
-    int    index             = -1;       // 缓冲区索引，用于映射到 MPP 输入缓冲槽位
-    int    fd                = -1;       // V4L2 导出的 dma-buf fd
-    void*  base              = nullptr;  // mmap 后的基地址
-    size_t Length            = 0;        // 缓冲区容量（字节）
-    size_t payloadSize       = 0;        // 当前帧有效载荷大小（字节）
-    bool   cpuSyncReadActive = false;    // 当前帧是否已执行 DMA_BUF_SYNC_START(READ)
+    int     index             = -1;  // 缓冲区索引，用于映射到 MPP 输入缓冲槽位
+    int     fd                = -1;  // V4L2 导出的 dma-buf fd
+    void*   base              = nullptr;  // mmap 后的基地址
+    size_t  Length            = 0;        // 缓冲区容量（字节）
+    size_t  payloadSize       = 0;        // 当前帧有效载荷大小（字节）
+    int64_t pts_us            = -1;       // 帧显示时间戳（微秒）
+    int64_t dts_us            = -1;       // 帧解码时间戳（微秒）
+    bool    cpuSyncReadActive = false;    // 当前帧是否已执行 DMA_BUF_SYNC_START(READ)
 };
 // 统一的可用于输入/输出的 DMA-BUF 描述结构，简化接口定义和使用。
 struct IO_FD_t
@@ -38,6 +40,8 @@ struct IO_FD_t
     uint32_t height     = 0;        // 图像高度（像素）
     uint32_t hor_stride = 0;        // 图像水平 stride（像素）
     uint32_t ver_stride = 0;        // 图像垂直 stride（像素）
+    int64_t  pts_us     = -1;       // 帧显示时间戳（微秒）
+    int64_t  dts_us     = -1;       // 帧解码时间戳（微秒）
 };
 
 struct VideoCaptureConfig
