@@ -635,9 +635,9 @@ int V4L2_Camera::init_camera_buffer()
     struct v4l2_requestbuffers reqbuf
     {};
     const __u32 requested_count = camera_params::kRequestBufferCount;
-    reqbuf.count                = requested_count;
-    reqbuf.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    reqbuf.memory               = V4L2_MEMORY_DMABUF;
+    reqbuf.count                = requested_count;              // 请求的缓冲区数量
+    reqbuf.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;  // 视频捕获
+    reqbuf.memory               = V4L2_MEMORY_DMABUF;           // 使用 DMABUF 方式
     if (ioctl(camera_fd, VIDIOC_REQBUFS, &reqbuf) < 0)
     {
         std::cerr << "Failed to request DMABUF capture buffers: " << std::strerror(errno)
@@ -667,14 +667,15 @@ int V4L2_Camera::init_camera_buffer()
     {
         int   dma_fd   = -1;
         void* dma_base = nullptr;
-        if (alloc_dma_buf_fd(alloc_size, &dma_fd, &dma_base) != 0)
+        if (alloc_dma_buf_fd(alloc_size, &dma_fd, &dma_base) !=
+            0)  // 这里才是实际发生内存申请的地方
         {
             std::cerr << "Failed to allocate DMABUF for camera pool, index=" << i << std::endl;
             deinit_camera_buffer();
             return -1;
         }
 
-        FrameDescArray[i].index  = static_cast<int>(i);
+        FrameDescArray[i].index  = static_cast<int>(i);  // 后续利用 index 来查找
         FrameDescArray[i].fd     = dma_fd;
         FrameDescArray[i].base   = dma_base;
         FrameDescArray[i].Length = alloc_size;
@@ -686,10 +687,12 @@ int V4L2_Camera::init_camera_buffer()
     {
         struct v4l2_buffer buffer
         {};
-        buffer.index  = static_cast<__u32>(i);
+        buffer.index = static_cast<__u32>(
+            i);  // 这里的 index 保持和 FrameDescArray[i].index 一致，方便后续通过 index 查找对应的
+                 // DMABUF fd 和用户态映射地址
         buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buffer.memory = V4L2_MEMORY_DMABUF;
-        buffer.m.fd   = FrameDescArray[i].fd;
+        buffer.m.fd = FrameDescArray[i].fd;  // 在这里告知驱动使用用户提供的 DMABUF fd
         buffer.length = static_cast<__u32>(FrameDescArray[i].Length);
 
         if (ioctl(camera_fd, VIDIOC_QBUF, &buffer) < 0)
@@ -839,7 +842,9 @@ int V4L2_Camera::camera_read_frame(size_t* out_length, size_t max_buffer_size)
 
     unsigned int bufIdx    = 0;
     unsigned int frameSize = 0;
-    const int    read_rc   = dequeue_buffer(bufIdx, frameSize, max_buffer_size);
+    const int    read_rc =
+        dequeue_buffer(bufIdx, frameSize,
+                       max_buffer_size);  // 从驱动队列中取出一帧数据，得到对应的缓冲区索引和帧大小
     if (read_rc != camera_read_result::kOk)
     {
         *out_length = frameSize;
