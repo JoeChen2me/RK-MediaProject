@@ -110,6 +110,13 @@ int main()
     std::atomic_uint64_t zlm_input_ok{0};
     std::atomic_uint64_t zlm_input_fail{0};
 
+    // 与“编码输入 -> ZLM 推流”直接相关的数据流（关键路径）：
+    // 解码输出(IO_FD_t*) -> rgaConsumeQueue
+    // -> RGA 处理 -> mppEncodeInputQueue
+    // -> MppEncInstance::EncodePushFrame(送编码器)
+    // -> MppEncInstance::EncoderGetPacket(取编码输出 packet)
+    // -> pending_au 组帧（按 AU 拼接）
+    // -> zlm_publisher.InputPacketChunk(送入 ZLM 媒体源)
     std::mutex ready_mutex;               // 保护 readyQueue 的互斥锁 相机->解码线程
     std::mutex recycle_mutex;             // 保护 recycleQueue 的互斥锁 解码线程->相机
     std::mutex rga_consume_mutex;         // 保护 rgaConsumeQueue 的互斥锁 解码线程->RGA 线程
@@ -433,6 +440,8 @@ int main()
             {
                 if (!encoder_io_ready)
                 {
+                    // 首次进入时，把 RGA 输出池（DMA-BUF fd）一次性导入编码器。
+                    // 这样后续 EncodePushFrame 可以按 fd 零拷贝送入，避免重复导入开销。
                     if (mpp_encoder_instance.AllocBufferForIO(
                             rga_instance.output_pool_, resource_limits::kRgaOutputBufferCount) != 0)
                     {
@@ -450,8 +459,11 @@ int main()
                 {
                     {
                         std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
-                        mppEncodeInputQueue.push_back(rga_output);  // 压入MPP编码输入队列
+                        // 这里是“编码输入路径”的入口：RGA 输出帧进入编码输入队列。
+                        // 注意：此时数据还没有到 ZLM，只是准备送进编码器。
+                        mppEncodeInputQueue.push_back(rga_output);
                     }
+                    // 唤醒编码输入线程，尽快把该帧喂给编码器。
                     mpp_encode_input_cv.notify_one();
                 }
             }
@@ -476,6 +488,8 @@ int main()
 
     auto run_mpp_encode_input_thread = [&]()
     {
+        // 该线程职责：只做“把 RGA 输出帧送入 MPP 编码器”。
+        // 不直接和 ZLM 交互；ZLM 输入发生在编码输出线程。
         constexpr size_t kMaxEncodePushRetry  = 200;
         size_t           encode_push_failures = 0;
         while (true)
@@ -497,12 +511,14 @@ int main()
                 mppEncodeInputQueue.pop_front();
             }
 
+            // 空指针保护，理论上不应该出现。
             if (!encode_input_desc)
             {
                 continue;
             }
             if (stop_requested.load())
             {
+                // 停止阶段如果还有待编码帧，回收到 RGA 池，避免泄漏。
                 (void)rga_instance.QueueOutputToRecycle(encode_input_desc);
                 break;
             }
@@ -514,6 +530,7 @@ int main()
                     (void)rga_instance.QueueOutputToRecycle(encode_input_desc);
                     break;
                 }
+                // 编码器暂时拥塞/忙时，允许有限重试，避免瞬时抖动导致整条链路退出。
                 encode_push_failures++;
                 if (encode_push_failures <= kMaxEncodePushRetry)
                 {
@@ -532,6 +549,7 @@ int main()
                     continue;
                 }
 
+                // 持续失败视作致命故障：记录并触发全局停机。
                 std::cerr << "Failed to push frame to encoder after retries, fd="
                           << encode_input_desc->fd << ", retry=" << encode_push_failures
                           << std::endl;
@@ -543,7 +561,8 @@ int main()
             }
 
             encode_push_failures = 0;
-            // encode_put_frame 为阻塞式，返回时输入帧已被编码器消费，可立即回收。
+            // EncodePushFrame 内部为阻塞提交，返回时编码器已接管输入数据。
+            // 因此这里可以立刻把 RGA 输出回收到池中，供后续帧复用。
             if (rga_instance.QueueOutputToRecycle(encode_input_desc) != 0)
             {
                 std::cerr << "Failed to recycle RGA output after encode_put_frame, fd="
@@ -553,12 +572,15 @@ int main()
                 break;
             }
         }
+        // 通知编码输出线程：不会再有新的输入送入编码器。
         encode_input_done.store(true);
     };
     std::thread mpp_encode_input_thread(run_mpp_encode_input_thread);
 
     auto run_mpp_encode_output_thread = [&]()
     {
+        // 该线程职责：从编码器拉取 packet，拼成完整 AU，再送到 ZLM。
+        // 它是“编码器 -> ZLM”的唯一桥接点。
         auto                 last_stat_tp = std::chrono::steady_clock::now();
         std::vector<uint8_t> pending_au;
         int64_t              pending_dts_us   = -1;
@@ -570,10 +592,14 @@ int main()
         int64_t              last_pkt_pts_us  = -1;
         auto                 flush_pending_au = [&]()
         {
+            // 只有拼出了有效 AU 才送 ZLM。
             if (pending_au.empty())
             {
                 return;
             }
+
+            // 构造一个完整访问单元视图（AU）。
+            // 这里把分片状态重置为“完整帧”，交给 ZlmPublisher 做 AnnexB/NALU 处理。
             EncPacketView au_view;
             au_view.data         = pending_au.data();
             au_view.len          = pending_au.size();
@@ -585,6 +611,7 @@ int main()
             au_view.is_extra     = false;
             au_view.handle       = nullptr;
 
+            // 真正送入 ZLM 的调用点：InputPacketChunk -> mk_media_input_h264。
             if (zlm_publisher.InputPacketChunk(au_view) == 0)
             {
                 zlm_input_ok.fetch_add(
@@ -595,6 +622,8 @@ int main()
                 zlm_input_fail.fetch_add(1, std::memory_order_relaxed);
                 std::cerr << "Failed to input encoded AU to ZLM, len=" << au_view.len << std::endl;
             }
+
+            // 清理当前 AU 聚合状态，准备拼下一帧。
             pending_au.clear();
             pending_dts_us = -1;
             pending_pts_us = -1;
@@ -664,7 +693,8 @@ int main()
             last_pkt_pts_us = pkt_view.pts_us;
             if (pkt_view.data && pkt_view.len > 0)  // 确保数据有效
             {
-                if (pending_au.empty())  // 说明当前这个 packet 是一个新的 AU 的开始
+                // 第一片 packet 到来时，初始化当前 AU 的时间戳上下文。
+                if (pending_au.empty())
                 {
                     pending_dts_us = pkt_view.dts_us;
                     pending_pts_us = pkt_view.pts_us;
@@ -672,6 +702,7 @@ int main()
                 }
                 else
                 {
+                    // 后续分片补齐时间戳和 EOS 状态（优先保留可用的时间戳）。
                     pending_eos = pending_eos || pkt_view.eos;
                     if (pending_dts_us < 0 && pkt_view.dts_us >= 0)
                     {
@@ -687,6 +718,7 @@ int main()
                     pending_au.end(), packet_bytes_addr,
                     packet_bytes_addr + pkt_view.len);  // 将当前 packet 的数据追加到 pending_au 中
             }
+            // 先缓存必要状态，再释放 packet 句柄（避免释放后访问失效数据）。
             const bool packet_is_partition = pkt_view.is_partition;
             const bool packet_is_eoi       = pkt_view.is_eoi;
             const bool packet_eos          = pkt_view.eos;
@@ -697,6 +729,10 @@ int main()
                 request_stop();
                 break;
             }
+            // 判定“当前 AU 是否完整”：
+            // 1) 非分片模式：单包就是完整 AU；
+            // 2) 分片模式：遇到 eoi 表示该帧结束；
+            // 3) eos：流结束也要强制 flush。
             const bool au_done = (!packet_is_partition) || packet_is_eoi || packet_eos;
             if (au_done)  // 完整的AU 拿到了，送给 ZLM 推流
             {
