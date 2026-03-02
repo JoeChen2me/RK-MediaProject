@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "rkmppdec.h"
+#include "rknnInfer.h"
 #include "rkrga.h"
 #include "v4l2Camera.h"
 #include "rkmppenc.h"
@@ -17,6 +18,18 @@
 
 const std::string            device      = "/dev/video0";  // USB 摄像头路径
 static volatile sig_atomic_t should_exit = 0;              // 用于控制程序退出的标志
+
+namespace
+{
+constexpr bool     kEnableNpuInference   = true;
+constexpr char     kRknnModelPath[]      =
+    "/home/joe/Code/V4L2-Develop/Basic_WthoutAI/experiments/modelOnnx/yolov8n_rk3588_i8.rknn";
+constexpr float    kNpuDefaultBoxThresh  = 0.25F;
+constexpr float    kNpuDefaultNmsThresh  = 0.45F;
+constexpr int      kNpuDefaultLineWidth  = 4;
+constexpr uint32_t kNpuDefaultDrawColor  = 0x000000FFU;
+constexpr size_t   kMaxNpuQueueDepth     = resource_limits::kRgaOutputBufferCount / 2U;
+}  // namespace
 
 static void signal_handler(int signum)
 {
@@ -85,6 +98,25 @@ int main()
         return 1;
     }
 
+    bool          npu_enabled = kEnableNpuInference;
+    RknnYoloInfer rknn_infer_instance;
+    if (npu_enabled)
+    {
+        RknnYoloConfig npu_cfg;
+        npu_cfg.model_path       = kRknnModelPath;
+        npu_cfg.box_thresh       = kNpuDefaultBoxThresh;
+        npu_cfg.nms_thresh       = kNpuDefaultNmsThresh;
+        npu_cfg.draw_thickness   = kNpuDefaultLineWidth;
+        npu_cfg.draw_color_rgba  = kNpuDefaultDrawColor;
+        npu_cfg.enable_letterbox = true;
+        if (rknn_infer_instance.Init(npu_cfg) != 0)
+        {
+            std::cerr << "Failed to initialize RKNN inference instance, model="
+                      << npu_cfg.model_path << std::endl;
+            return 1;
+        }
+    }
+
     ZlmPublisher zlm_publisher;
     if (zlm_publisher.Init() != 0)
     {
@@ -112,7 +144,8 @@ int main()
 
     // 与“编码输入 -> ZLM 推流”直接相关的数据流（关键路径）：
     // 解码输出(IO_FD_t*) -> rgaConsumeQueue
-    // -> RGA 处理 -> mppEncodeInputQueue
+    // -> RGA 处理 -> npuInputQueue
+    // -> NPU 推理与画框 -> mppEncodeInputQueue
     // -> MppEncInstance::EncodePushFrame(送编码器)
     // -> MppEncInstance::EncoderGetPacket(取编码输出 packet)
     // -> pending_au 组帧（按 AU 拼接）
@@ -121,25 +154,30 @@ int main()
     std::mutex recycle_mutex;             // 保护 recycleQueue 的互斥锁 解码线程->相机
     std::mutex rga_consume_mutex;         // 保护 rgaConsumeQueue 的互斥锁 解码线程->RGA 线程
     std::mutex mpp_recycle_output_mutex;  // 保护 mppRecycleOutputQueue 的互斥锁 RGA 线程->解码线程
-    std::mutex mpp_encode_input_mutex;    // 保护 mppEncodeInputQueue 的互斥锁 RGA 线程->编码线程
+    std::mutex npu_input_mutex;           // 保护 npuInputQueue 的互斥锁 RGA 线程->NPU 线程
+    std::mutex mpp_encode_input_mutex;    // 保护 mppEncodeInputQueue 的互斥锁 NPU 线程->编码线程
     std::condition_variable    ready_cv;  // 用于通知解码线程有新帧可处理的条件变量
     std::condition_variable    rga_consume_cv;         // 用于通知 RGA 线程有新帧可处理的条件变量
     std::condition_variable    mpp_recycle_output_cv;  // 用于通知解码输出可回收线程有新数据
+    std::condition_variable    npu_input_cv;           // 用于通知 NPU 线程有新帧可处理
     std::condition_variable    mpp_encode_input_cv;    // 用于通知编码输入线程有新帧可处理
     std::deque<FrameDesc*>     readyQueue;             // 存储已捕获但未解码的帧描述指针的队列
     std::deque<FrameDesc*>     recycleQueue;     /// 存储已处理完毕、等待回收的帧描述指针的队列
     std::deque<const IO_FD_t*> rgaConsumeQueue;  // 存储已解码但未 RGA 处理的帧描述指针的队列
     std::deque<const IO_FD_t*>
         mppRecycleOutputQueue;                       // 存储已 RGA 处理但未回收的输出描述指针的队列
-    std::deque<const IO_FD_t*> mppEncodeInputQueue;  // 存储已 RGA 处理但未送编码的帧描述指针的队列
+    std::deque<const IO_FD_t*> npuInputQueue;        // 存储已 RGA 处理但未 NPU 推理的帧描述指针
+    std::deque<const IO_FD_t*> mppEncodeInputQueue;  // 存储已 NPU 处理但未送编码的帧描述指针
 
     // 开关
     std::atomic_bool stop_requested{false};
     std::atomic_bool fatal_error{false};
     std::atomic_bool rga_thread_done{false};  // RGA线程退出标志  其退出后回收线程再退出
+    std::atomic_bool npu_thread_done{false};
     std::atomic_bool encode_input_done{false};
     // 统计信息
     size_t           dropped_frames = 0;
+    size_t           npu_dropped_frames = 0;
     constexpr size_t kMaxReadyQueueDepth =
         resource_limits::kCameraRequestBufferCount * 0.75;  // 控制端到端延迟，超限时丢弃最旧帧
     constexpr auto kRetryBackoffSleep = std::chrono::milliseconds(2);  // 重试退避，避免短时间忙轮询
@@ -153,6 +191,7 @@ int main()
         ready_cv.notify_all();
         rga_consume_cv.notify_all();
         mpp_recycle_output_cv.notify_all();
+        npu_input_cv.notify_all();
         mpp_encode_input_cv.notify_all();
     };
 
@@ -457,14 +496,38 @@ int main()
                 }
                 if (encoder_io_ready && !stop_requested.load() && rga_output != nullptr)
                 {
+                    if (npu_enabled)
                     {
-                        std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
-                        // 这里是“编码输入路径”的入口：RGA 输出帧进入编码输入队列。
-                        // 注意：此时数据还没有到 ZLM，只是准备送进编码器。
-                        mppEncodeInputQueue.push_back(rga_output);
+                        const IO_FD_t* dropped_npu_desc = nullptr;
+                        {
+                            std::lock_guard<std::mutex> lock(npu_input_mutex);
+                            if (npuInputQueue.size() >= kMaxNpuQueueDepth)
+                            {
+                                dropped_npu_desc = npuInputQueue.front();
+                                npuInputQueue.pop_front();
+                            }
+                            npuInputQueue.push_back(rga_output);
+                        }
+                        if (dropped_npu_desc)
+                        {
+                            npu_dropped_frames++;
+                            if (rga_instance.QueueOutputToRecycle(dropped_npu_desc) != 0)
+                            {
+                                std::cerr << "Failed to recycle dropped NPU input, fd="
+                                          << dropped_npu_desc->fd << std::endl;
+                            }
+                        }
+                        npu_input_cv.notify_one();
                     }
-                    // 唤醒编码输入线程，尽快把该帧喂给编码器。
-                    mpp_encode_input_cv.notify_one();
+                    else
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
+                            // 关闭 NPU 时，RGA 输出直接进入编码输入队列。
+                            mppEncodeInputQueue.push_back(rga_output);
+                        }
+                        mpp_encode_input_cv.notify_one();
+                    }
                 }
             }
 
@@ -483,8 +546,81 @@ int main()
         }
         rga_thread_done.store(true);
         mpp_recycle_output_cv.notify_all();
+        npu_input_cv.notify_all();
     };
     std::thread rga_thread(run_rga_thread);
+
+    auto run_npu_thread = [&]()
+    {
+        size_t npu_frame_count = 0;
+        size_t npu_failures    = 0;
+        auto   last_stat_tp    = std::chrono::steady_clock::now();
+        while (true)
+        {
+            const IO_FD_t* npu_input_desc = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(npu_input_mutex);
+                npu_input_cv.wait(
+                    lock,
+                    [&]()
+                    { return !npuInputQueue.empty() || (stop_requested.load() && rga_thread_done.load()); });
+                if (npuInputQueue.empty())
+                {
+                    if (stop_requested.load() && rga_thread_done.load())
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                npu_input_desc = npuInputQueue.front();
+                npuInputQueue.pop_front();
+            }
+
+            if (!npu_input_desc)
+            {
+                continue;
+            }
+
+            NpuDetResult det_result{};
+            if (rknn_infer_instance.InferAndDraw(npu_input_desc, &det_result) != 0)
+            {
+                npu_failures++;
+                if ((npu_failures % 30U) == 1U)
+                {
+                    std::cerr << "NPU infer failed, fallback to pass-through, fd="
+                              << npu_input_desc->fd << ", failures=" << npu_failures << std::endl;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
+                mppEncodeInputQueue.push_back(npu_input_desc);
+            }
+            mpp_encode_input_cv.notify_one();
+
+            npu_frame_count++;
+            const auto now_tp = std::chrono::steady_clock::now();
+            if (now_tp - last_stat_tp >= std::chrono::seconds(5))
+            {
+                last_stat_tp = now_tp;
+                std::cout << "[NPU] processed=" << npu_frame_count
+                          << ", fail=" << npu_failures
+                          << ", drop=" << npu_dropped_frames << std::endl;
+            }
+        }
+        npu_thread_done.store(true);
+        mpp_encode_input_cv.notify_all();
+    };
+
+    std::thread npu_thread;
+    if (npu_enabled)
+    {
+        npu_thread = std::thread(run_npu_thread);
+    }
+    else
+    {
+        npu_thread_done.store(true);
+    }
 
     auto run_mpp_encode_input_thread = [&]()
     {
@@ -498,10 +634,12 @@ int main()
             {
                 std::unique_lock<std::mutex> lock(mpp_encode_input_mutex);
                 mpp_encode_input_cv.wait(
-                    lock, [&]() { return !mppEncodeInputQueue.empty() || stop_requested.load(); });
+                    lock,
+                    [&]()
+                    { return !mppEncodeInputQueue.empty() || (stop_requested.load() && npu_thread_done.load()); });
                 if (mppEncodeInputQueue.empty())
                 {
-                    if (stop_requested.load())
+                    if (stop_requested.load() && npu_thread_done.load())
                     {
                         break;
                     }
@@ -786,6 +924,10 @@ int main()
     {
         rga_thread.join();
     }
+    if (npu_thread.joinable())
+    {
+        npu_thread.join();
+    }
     if (mpp_encode_input_thread.joinable())
     {
         mpp_encode_input_thread.join();
@@ -799,6 +941,26 @@ int main()
         mpp_output_recycle_thread.join();
     }
     drain_mpp_recycle_requests();  // 确保所有待回收的输出都被处理掉，避免资源泄漏
+
+    {
+        std::deque<const IO_FD_t*> pending_npu_inputs;
+        {
+            std::lock_guard<std::mutex> lock(npu_input_mutex);
+            while (!npuInputQueue.empty())
+            {
+                pending_npu_inputs.push_back(npuInputQueue.front());
+                npuInputQueue.pop_front();
+            }
+        }
+        for (const IO_FD_t* output_desc : pending_npu_inputs)
+        {
+            if (rga_instance.QueueOutputToRecycle(output_desc) != 0)
+            {
+                std::cerr << "Failed to recycle pending npu input descriptor, fd="
+                          << ((output_desc) ? output_desc->fd : -1) << std::endl;
+            }
+        }
+    }
 
     {
         std::deque<const IO_FD_t*> pending_encode_inputs;
@@ -840,15 +1002,25 @@ int main()
         mppRecycleOutputQueue.clear();
     }
     {
+        std::lock_guard<std::mutex> lock(npu_input_mutex);
+        npuInputQueue.clear();
+    }
+    {
         std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
         mppEncodeInputQueue.clear();
     }
+
+    rknn_infer_instance.Deinit();
 
     // 依赖析构函数完成资源的回收
     if (dropped_frames > 0)
     {
         std::cout << "Dropped old frames due to readyQueue backlog: " << dropped_frames
                   << std::endl;
+    }
+    if (npu_dropped_frames > 0)
+    {
+        std::cout << "Dropped frames due to NPU backlog: " << npu_dropped_frames << std::endl;
     }
     std::cout << "Camera opened and closed successfully" << std::endl;
     return fatal_error.load() ? 1 : 0;
