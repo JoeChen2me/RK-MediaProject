@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct NpuDetBox
 {
@@ -45,8 +46,17 @@ class RknnYoloInfer
     int  InferAndDraw(const IO_FD_t* nv12_frame, NpuDetResult* out);
 
    private:
-    bool           initialized_ = false;
-    RknnYoloConfig cfg_         = {};
+    bool                  initialized_ = false;
+    RknnYoloConfig        cfg_         = {};
+    rknn_context          rknn_ctx_    = 0;
+    rknn_input_output_num io_num_      = {};
+    std::vector<rknn_tensor_attr> input_attrs_  = {};
+    std::vector<rknn_tensor_attr> output_attrs_ = {};
+    int                          model_channel_ = 0;
+    int                          model_width_   = 0;
+    int                          model_height_  = 0;
+    bool                         is_quant_      = false;
+    std::vector<uint8_t>         input_rgb_     = {};
 };
 
 #endif
