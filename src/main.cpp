@@ -21,14 +21,14 @@ static volatile sig_atomic_t should_exit = 0;              // 用于控制程序
 
 namespace
 {
-constexpr bool     kEnableNpuInference   = true;
-constexpr char     kRknnModelPath[]      =
+constexpr bool kEnableNpuInference = true;
+constexpr char kRknnModelPath[] =
     "/home/joe/Code/V4L2-Develop/Basic_WthoutAI/experiments/modelOnnx/yolov8n_rk3588_i8.rknn";
-constexpr float    kNpuDefaultBoxThresh  = 0.25F;
-constexpr float    kNpuDefaultNmsThresh  = 0.45F;
-constexpr int      kNpuDefaultLineWidth  = 4;
-constexpr uint32_t kNpuDefaultDrawColor  = 0x000000FFU;
-constexpr size_t   kMaxNpuQueueDepth     = resource_limits::kRgaOutputBufferCount / 2U;
+constexpr float    kNpuDefaultBoxThresh = 0.25F;
+constexpr float    kNpuDefaultNmsThresh = 0.45F;
+constexpr int      kNpuDefaultLineWidth = 4;
+constexpr uint32_t kNpuDefaultDrawColor = 0x000000FFU;
+constexpr size_t   kMaxNpuQueueDepth    = resource_limits::kRgaOutputBufferCount / 2U;
 }  // namespace
 
 static void signal_handler(int signum)
@@ -150,23 +150,23 @@ int main()
     // -> MppEncInstance::EncoderGetPacket(取编码输出 packet)
     // -> pending_au 组帧（按 AU 拼接）
     // -> zlm_publisher.InputPacketChunk(送入 ZLM 媒体源)
-    std::mutex ready_mutex;               // 保护 readyQueue 的互斥锁 相机->解码线程
-    std::mutex recycle_mutex;             // 保护 recycleQueue 的互斥锁 解码线程->相机
-    std::mutex rga_consume_mutex;         // 保护 rgaConsumeQueue 的互斥锁 解码线程->RGA 线程
+    std::mutex ready_mutex;        // 保护 readyQueue 的互斥锁 相机->解码线程
+    std::mutex recycle_mutex;      // 保护 recycleQueue 的互斥锁 解码线程->相机
+    std::mutex rga_consume_mutex;  // 保护 rgaConsumeQueue 的互斥锁 解码线程->RGA 线程
     std::mutex mpp_recycle_output_mutex;  // 保护 mppRecycleOutputQueue 的互斥锁 RGA 线程->解码线程
-    std::mutex npu_input_mutex;           // 保护 npuInputQueue 的互斥锁 RGA 线程->NPU 线程
-    std::mutex mpp_encode_input_mutex;    // 保护 mppEncodeInputQueue 的互斥锁 NPU 线程->编码线程
-    std::condition_variable    ready_cv;  // 用于通知解码线程有新帧可处理的条件变量
-    std::condition_variable    rga_consume_cv;         // 用于通知 RGA 线程有新帧可处理的条件变量
-    std::condition_variable    mpp_recycle_output_cv;  // 用于通知解码输出可回收线程有新数据
-    std::condition_variable    npu_input_cv;           // 用于通知 NPU 线程有新帧可处理
-    std::condition_variable    mpp_encode_input_cv;    // 用于通知编码输入线程有新帧可处理
-    std::deque<FrameDesc*>     readyQueue;             // 存储已捕获但未解码的帧描述指针的队列
-    std::deque<FrameDesc*>     recycleQueue;     /// 存储已处理完毕、等待回收的帧描述指针的队列
+    std::mutex npu_input_mutex;         // 保护 npuInputQueue 的互斥锁 RGA 线程->NPU 线程
+    std::mutex mpp_encode_input_mutex;  // 保护 mppEncodeInputQueue 的互斥锁 NPU 线程->编码线程
+    std::condition_variable ready_cv;  // 用于通知解码线程有新帧可处理的条件变量
+    std::condition_variable rga_consume_cv;  // 用于通知 RGA 线程有新帧可处理的条件变量
+    std::condition_variable mpp_recycle_output_cv;  // 用于通知解码输出可回收线程有新数据
+    std::condition_variable npu_input_cv;           // 用于通知 NPU 线程有新帧可处理
+    std::condition_variable mpp_encode_input_cv;  // 用于通知编码输入线程有新帧可处理
+    std::deque<FrameDesc*>  readyQueue;  // 存储已捕获但未解码的帧描述指针的队列
+    std::deque<FrameDesc*> recycleQueue;  /// 存储已处理完毕、等待回收的帧描述指针的队列
     std::deque<const IO_FD_t*> rgaConsumeQueue;  // 存储已解码但未 RGA 处理的帧描述指针的队列
     std::deque<const IO_FD_t*>
-        mppRecycleOutputQueue;                       // 存储已 RGA 处理但未回收的输出描述指针的队列
-    std::deque<const IO_FD_t*> npuInputQueue;        // 存储已 RGA 处理但未 NPU 推理的帧描述指针
+        mppRecycleOutputQueue;  // 存储已 RGA 处理但未回收的输出描述指针的队列
+    std::deque<const IO_FD_t*> npuInputQueue;  // 存储已 RGA 处理但未 NPU 推理的帧描述指针
     std::deque<const IO_FD_t*> mppEncodeInputQueue;  // 存储已 NPU 处理但未送编码的帧描述指针
 
     // 开关
@@ -176,8 +176,10 @@ int main()
     std::atomic_bool npu_thread_done{false};
     std::atomic_bool encode_input_done{false};
     // 统计信息
-    size_t           dropped_frames = 0;
+    size_t           dropped_frames     = 0;
     size_t           npu_dropped_frames = 0;
+    size_t           npu_queue_peak     = 0;
+    size_t           encode_queue_peak  = 0;
     constexpr size_t kMaxReadyQueueDepth =
         resource_limits::kCameraRequestBufferCount * 0.75;  // 控制端到端延迟，超限时丢弃最旧帧
     constexpr auto kRetryBackoffSleep = std::chrono::milliseconds(2);  // 重试退避，避免短时间忙轮询
@@ -396,8 +398,7 @@ int main()
                 std::unique_lock<std::mutex> lock(mpp_recycle_output_mutex);
                 mpp_recycle_output_cv.wait(
                     lock,
-                    [&]()
-                    {
+                    [&]() {
                         return !mppRecycleOutputQueue.empty() ||
                                (stop_requested.load() && rga_thread_done.load());
                     });
@@ -507,6 +508,10 @@ int main()
                                 npuInputQueue.pop_front();
                             }
                             npuInputQueue.push_back(rga_output);
+                            if (npuInputQueue.size() > npu_queue_peak)
+                            {
+                                npu_queue_peak = npuInputQueue.size();
+                            }
                         }
                         if (dropped_npu_desc)
                         {
@@ -525,6 +530,10 @@ int main()
                             std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
                             // 关闭 NPU 时，RGA 输出直接进入编码输入队列。
                             mppEncodeInputQueue.push_back(rga_output);
+                            if (mppEncodeInputQueue.size() > encode_queue_peak)
+                            {
+                                encode_queue_peak = mppEncodeInputQueue.size();
+                            }
                         }
                         mpp_encode_input_cv.notify_one();
                     }
@@ -552,18 +561,21 @@ int main()
 
     auto run_npu_thread = [&]()
     {
-        size_t npu_frame_count = 0;
-        size_t npu_failures    = 0;
-        auto   last_stat_tp    = std::chrono::steady_clock::now();
+        size_t  npu_frame_count = 0;
+        size_t  npu_failures    = 0;
+        int64_t npu_total_us    = 0;
+        int64_t npu_max_us      = 0;
+        auto    last_stat_tp    = std::chrono::steady_clock::now();
         while (true)
         {
             const IO_FD_t* npu_input_desc = nullptr;
             {
                 std::unique_lock<std::mutex> lock(npu_input_mutex);
-                npu_input_cv.wait(
-                    lock,
-                    [&]()
-                    { return !npuInputQueue.empty() || (stop_requested.load() && rga_thread_done.load()); });
+                npu_input_cv.wait(lock,
+                                  [&]() {
+                                      return !npuInputQueue.empty() ||
+                                             (stop_requested.load() && rga_thread_done.load());
+                                  });
                 if (npuInputQueue.empty())
                 {
                     if (stop_requested.load() && rga_thread_done.load())
@@ -582,6 +594,7 @@ int main()
             }
 
             NpuDetResult det_result{};
+            const auto   infer_start_tp = std::chrono::steady_clock::now();
             if (rknn_infer_instance.InferAndDraw(npu_input_desc, &det_result) != 0)
             {
                 npu_failures++;
@@ -591,10 +604,22 @@ int main()
                               << npu_input_desc->fd << ", failures=" << npu_failures << std::endl;
                 }
             }
+            const int64_t infer_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - infer_start_tp)
+                                         .count();
+            npu_total_us += infer_us;
+            if (infer_us > npu_max_us)
+            {
+                npu_max_us = infer_us;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
                 mppEncodeInputQueue.push_back(npu_input_desc);
+                if (mppEncodeInputQueue.size() > encode_queue_peak)
+                {
+                    encode_queue_peak = mppEncodeInputQueue.size();
+                }
             }
             mpp_encode_input_cv.notify_one();
 
@@ -602,10 +627,27 @@ int main()
             const auto now_tp = std::chrono::steady_clock::now();
             if (now_tp - last_stat_tp >= std::chrono::seconds(5))
             {
-                last_stat_tp = now_tp;
-                std::cout << "[NPU] processed=" << npu_frame_count
-                          << ", fail=" << npu_failures
-                          << ", drop=" << npu_dropped_frames << std::endl;
+                last_stat_tp              = now_tp;
+                size_t npu_queue_depth    = 0;
+                size_t encode_queue_depth = 0;
+                {
+                    std::lock_guard<std::mutex> lock(npu_input_mutex);
+                    npu_queue_depth = npuInputQueue.size();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mpp_encode_input_mutex);
+                    encode_queue_depth = mppEncodeInputQueue.size();
+                }
+                const double infer_avg_ms = (npu_frame_count == 0U)
+                                                ? 0.0
+                                                : static_cast<double>(npu_total_us) /
+                                                      static_cast<double>(npu_frame_count) / 1000.0;
+                std::cout << "[NPU] processed=" << npu_frame_count << ", fail=" << npu_failures
+                          << ", drop=" << npu_dropped_frames << ", infer_avg_ms=" << infer_avg_ms
+                          << ", infer_max_ms=" << (static_cast<double>(npu_max_us) / 1000.0)
+                          << ", npu_q=" << npu_queue_depth << "/" << npu_queue_peak
+                          << ", enc_q=" << encode_queue_depth << "/" << encode_queue_peak
+                          << std::endl;
             }
         }
         npu_thread_done.store(true);
@@ -635,8 +677,10 @@ int main()
                 std::unique_lock<std::mutex> lock(mpp_encode_input_mutex);
                 mpp_encode_input_cv.wait(
                     lock,
-                    [&]()
-                    { return !mppEncodeInputQueue.empty() || (stop_requested.load() && npu_thread_done.load()); });
+                    [&]() {
+                        return !mppEncodeInputQueue.empty() ||
+                               (stop_requested.load() && npu_thread_done.load());
+                    });
                 if (mppEncodeInputQueue.empty())
                 {
                     if (stop_requested.load() && npu_thread_done.load())
